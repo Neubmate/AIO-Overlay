@@ -344,9 +344,12 @@ int main() {
     _setmode(_fileno(stdout), _O_U16TEXT);
     LoadSettings();
     InitDiskPdh();
+    InitGpuInfo();
+    InitNvidiaGpu();
 
     std::thread(MonitorCpu).detach();
     std::thread(MonitorSystem).detach();
+    std::thread(MonitorGpu).detach();
     std::thread([]() { GetDetailedRamInfo(); }).detach();
     std::thread(CheckStorage).detach();
 
