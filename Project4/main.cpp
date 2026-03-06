@@ -28,7 +28,6 @@ struct AppConfig {
     bool showRam = true;
     bool showRamDetail = true;
     bool showGpu = true;
-    bool showVram = true;
     bool showDrives = true;
     bool showDiskIo = true;
     bool showBios = true;
@@ -58,11 +57,10 @@ RECT g_RectFanControl = { 0 };
 bool g_DraggingFan = false; // Tracks if user is holding the slider
 
 void SaveSettings() {
-    std::wofstream file(L"settings.json");
-    if (file.is_open()) file << L"{}";
 }
 
-void LoadSettings() {}
+void LoadSettings() {
+}
 
 LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_CLOSE) ShowWindow(hwnd, SW_HIDE);
@@ -70,11 +68,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 }
 
 void OpenSettingsWindow(HINSTANCE hInst) {
-    if (g_hSettings) { ShowWindow(g_hSettings, SW_SHOW); return; }
-    WNDCLASSW wc = { 0 }; wc.lpfnWndProc = SettingsWndProc; wc.hInstance = hInst; wc.lpszClassName = L"CfgMenu";
-    RegisterClassW(&wc);
-    g_hSettings = CreateWindowW(L"CfgMenu", L"Settings", WS_OVERLAPPEDWINDOW, 100, 100, 300, 400, NULL, NULL, hInst, NULL);
-    ShowWindow(g_hSettings, SW_SHOW);
 }
 
 void DrawRoundedRect(Gdiplus::Graphics* g, Gdiplus::Brush* fillBrush, Gdiplus::Pen* borderPen, int x, int y, int w, int h, int r) {
@@ -179,13 +172,50 @@ void DrawAppleUI(Gdiplus::Graphics* g, int w, int h) {
 
     if (g_Cfg.showGpu) {
         DrawStr(g, g_GpuName.c_str(), &fBody, x, y, &bWhite); y += 18.0f;
-        if (g_GpuVramTotal > 0) {
-            float vramPct = (float)g_GpuVramUsed / (float)g_GpuVramTotal;
-            DrawPillBar(g, x, y, contentW, 6, vramPct, &bBlue, &bTrack);
-            swprintf_s(buf, L"VRAM: %llu / %llu MB", g_GpuVramUsed / (1024 * 1024), g_GpuVramTotal / (1024 * 1024));
-            y += 12.0f; DrawStr(g, buf, &fSmall, x, y, &bGray);
+        
+        // Clock Information - Always show
+        swprintf_s(buf, L"Core Clock: %d MHz  (Min: %d  Max: %d)", 
+                   g_GpuCoreClock, g_GpuCoreClockMin == 999999 ? 0 : g_GpuCoreClockMin, g_GpuCoreClockMax);
+        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
+        
+        swprintf_s(buf, L"Memory Clock: %d MHz  (Min: %d  Max: %d)", 
+                   g_GpuMemClock, g_GpuMemClockMin == 999999 ? 0 : g_GpuMemClockMin, g_GpuMemClockMax);
+        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
+        
+        swprintf_s(buf, L"Video Clock: %d MHz  (Min: %d  Max: %d)", g_GpuVideoClock, 0, 0);
+        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
+        
+        // Bus Width - Always show
+        swprintf_s(buf, L"Bus Width: %d-bit", g_GpuMemBusWidth);
+        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
+        
+        // Power - Always show
+        Gdiplus::SolidBrush bPowerColor(g_GpuPowerDraw > (g_GpuPowerLimit * 0.9) ? Gdiplus::Color(255, 255, 204, 0) : 
+                                        Gdiplus::Color(255, 46, 204, 113));
+        swprintf_s(buf, L"Power: %.1fW / %.1fW  Fan: %d RPM", g_GpuPowerDraw, g_GpuPowerLimit, g_GpuFanRPM);
+        DrawStr(g, buf, &fSmall, x, y, &bPowerColor); y += 14.0f;
+        
+        // PCIe Information - Always show
+        std::wstring pciInfo = L"PCIe: ";
+        if (g_GpuPcieLanes > 0) {
+            wchar_t laneBuf[32];
+            swprintf_s(laneBuf, L"x%d", g_GpuPcieLanes);
+            pciInfo += laneBuf;
+        } else {
+            pciInfo += L"Unknown";
         }
-        y += 20.0f;
+        if (!g_GpuPciDeviceId.empty()) {
+            pciInfo += L"  ID: ";
+            size_t newsize = g_GpuPciDeviceId.size() + 1;
+            wchar_t* wcstring = new wchar_t[newsize];
+            size_t convertedChars = 0;
+            mbstowcs_s(&convertedChars, wcstring, newsize, g_GpuPciDeviceId.c_str(), _TRUNCATE);
+            pciInfo += wcstring;
+            delete[] wcstring;
+        }
+        DrawStr(g, pciInfo.c_str(), &fSmall, x, y, &bGray); y += 14.0f;
+        
+        y += 10.0f;
     }
 
     if (g_Cfg.showDrives) {
@@ -295,7 +325,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (y < 40) {
             if (x >= 20 && x <= 34) { PostQuitMessage(0); return 0; }
             if (x >= 40 && x <= 54) { g_Cfg.miniMode = !g_Cfg.miniMode; SaveSettings(); return 0; }
-            if (x >= 60 && x <= 80) { OpenSettingsWindow(GetModuleHandle(NULL)); return 0; }
         }
 
         if (g_Cfg.miniMode) {
@@ -349,9 +378,9 @@ int main() {
 
     std::thread(MonitorCpu).detach();
     std::thread(MonitorSystem).detach();
-    std::thread(MonitorGpu).detach();
     std::thread([]() { GetDetailedRamInfo(); }).detach();
     std::thread(CheckStorage).detach();
+    std::thread([]() { while (g_AppRunning) { MonitorGpu(); UpdateNvidiaStats(); std::this_thread::sleep_for(std::chrono::milliseconds(1000)); } }).detach();
 
     Gdiplus::GdiplusStartupInput gsi; ULONG_PTR tok; Gdiplus::GdiplusStartup(&tok, &gsi, NULL);
     int w = UI_WIDTH_NORMAL; int h = 850; int x = GetSystemMetrics(SM_CXSCREEN) - w - g_Cfg.xOffset;
@@ -375,10 +404,10 @@ int main() {
 
         int curW = g_Cfg.miniMode ? UI_WIDTH_MINI : UI_WIDTH_NORMAL; int curH = g_Cfg.miniMode ? 70 : 850;
         g.Clear(Gdiplus::Color(0, 0, 0, 0)); DrawAppleUI(&g, curW, curH);
-        POINT pSrc = { 0,0 }; SIZE sSize = { curW, curH }; POINT pPos = { x, g_Cfg.yOffset };
-        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-        UpdateLayeredWindow(g_hOverlay, sc, &pPos, &sSize, memDC, &pSrc, 0, &bf, ULW_ALPHA);
-        Sleep(30);
-    }
-    DeleteObject(memBM); DeleteDC(memDC); ReleaseDC(NULL, sc); Gdiplus::GdiplusShutdown(tok); return 0;
+         POINT pSrc = { 0,0 }; SIZE sSize = { curW, curH }; POINT pPos = { x, g_Cfg.yOffset };
+         BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+         UpdateLayeredWindow(g_hOverlay, sc, &pPos, &sSize, memDC, &pSrc, 0, &bf, ULW_ALPHA);
+         Sleep(30);
+     }
+     DeleteObject(memBM); DeleteDC(memDC); ReleaseDC(NULL, sc); Gdiplus::GdiplusShutdown(tok); return 0;
 }

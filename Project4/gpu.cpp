@@ -14,18 +14,80 @@ std::atomic<bool> g_GpuBenchRunning = false;
 unsigned long long g_GpuVramUsed = 0;
 unsigned long long g_GpuVramTotal = 0;
 
+// GPU Stats (NVAPI)
+int g_GpuTemp = 0;
+int g_GpuTempAvg = 0;
+int g_GpuTempMin = 999;
+int g_GpuTempMax = 0;
+int g_GpuCoreClock = 0;
+int g_GpuCoreClockMin = 999999;
+int g_GpuCoreClockMax = 0;
+int g_GpuMemClock = 0;
+int g_GpuMemClockMin = 999999;
+int g_GpuMemClockMax = 0;
+int g_GpuVideoClock = 0;
+int g_GpuUtilization = 0;
+int g_GpuMemUtilization = 0;
+double g_GpuPowerDraw = 0.0;
+double g_GpuPowerLimit = 0.0;
+int g_GpuFanRPM = 0;
+
+// GPU Hardware Info
+int g_GpuMemBusWidth = 0;
+unsigned long long g_GpuMemUsed = 0;
+unsigned long long g_GpuMemReserved = 0;
+std::wstring g_GpuMemType = L"Unknown";
+std::wstring g_GpuDriverVersion = L"Unknown";
+std::string g_GpuPciDeviceId = "N/A";
+int g_GpuPcieLanes = 0;
+
 void InitGpuInfo() {
-    WmiQuery wmi; wmi.Init();
-    IEnumWbemClassObject* pEnum = wmi.Exec(L"SELECT Name FROM Win32_VideoController");
-    if (pEnum) {
-        IWbemClassObject* pObj = NULL; ULONG uRet = 0;
-        pEnum->Next(WBEM_INFINITE, 1, &pObj, &uRet);
-        if (uRet) {
-            VARIANT v; pObj->Get(L"Name", 0, &v, 0, 0);
-            if (v.vt == VT_BSTR) { std::lock_guard<std::mutex> l(g_StatsMutex); g_GpuName = v.bstrVal; }
-            VariantClear(&v); pObj->Release();
+    std::string command = "nvidia-smi --query-gpu=name --format=csv,noheader -i 0";
+    std::string output;
+    
+    HANDLE hPipeRead, hPipeWrite;
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+    
+    if (CreatePipe(&hPipeRead, &hPipeWrite, &sa, 0)) {
+        STARTUPINFOA si = { 0 };
+        si.cb = sizeof(STARTUPINFOA);
+        si.hStdOutput = hPipeWrite;
+        si.hStdError = hPipeWrite;
+        si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+
+        PROCESS_INFORMATION pi = { 0 };
+        
+        if (CreateProcessA(NULL, (LPSTR)command.c_str(), NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            CloseHandle(hPipeWrite);
+            
+            char buffer[256] = { 0 };
+            DWORD bytesRead = 0;
+            if (ReadFile(hPipeRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL)) {
+                std::string gpuName(buffer);
+                // Remove trailing whitespace/newlines
+                gpuName.erase(gpuName.find_last_not_of(" \n\r\t") + 1);
+                
+                if (!gpuName.empty()) {
+                    std::lock_guard<std::mutex> l(g_StatsMutex);
+                    int len = MultiByteToWideChar(CP_UTF8, 0, gpuName.c_str(), -1, NULL, 0);
+                    if (len > 0) {
+                        wchar_t* wstr = new wchar_t[len];
+                        MultiByteToWideChar(CP_UTF8, 0, gpuName.c_str(), -1, wstr, len);
+                        g_GpuName = wstr;
+                        delete[] wstr;
+                    }
+                }
+            }
+            
+            CloseHandle(hPipeRead);
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        } else {
+            CloseHandle(hPipeRead);
+            CloseHandle(hPipeWrite);
         }
-        pEnum->Release();
     }
 }
 

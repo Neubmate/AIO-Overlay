@@ -48,6 +48,33 @@ extern std::wstring g_GpuName;
 extern unsigned long long g_GpuVramUsed;
 extern unsigned long long g_GpuVramTotal;
 
+// GPU Stats (NVAPI)
+extern int g_GpuTemp;
+extern int g_GpuTempAvg;
+extern int g_GpuTempMin;
+extern int g_GpuTempMax;
+extern int g_GpuCoreClock;
+extern int g_GpuCoreClockMin;
+extern int g_GpuCoreClockMax;
+extern int g_GpuMemClock;
+extern int g_GpuMemClockMin;
+extern int g_GpuMemClockMax;
+extern int g_GpuVideoClock;
+extern int g_GpuUtilization;
+extern int g_GpuMemUtilization;
+extern double g_GpuPowerDraw;
+extern double g_GpuPowerLimit;
+extern int g_GpuFanRPM;
+
+// GPU Hardware Info
+extern int g_GpuMemBusWidth;
+extern unsigned long long g_GpuMemUsed;
+extern unsigned long long g_GpuMemReserved;
+extern std::wstring g_GpuMemType;
+extern std::wstring g_GpuDriverVersion;
+extern std::string g_GpuPciDeviceId;
+extern int g_GpuPcieLanes;
+
 extern std::wstring g_MoboName;
 extern std::wstring g_BiosWmi;
 extern std::wstring g_UpgradePath;
@@ -94,10 +121,12 @@ void StartGpuStress();
 void StartRamStress();
 void MonitorCpu();
 void MonitorGpu();
+void RefreshGpuStats();
 void MonitorSystem();
 void InitGpuInfo();
 void InitNvidiaGpu();
 void UpdateGpuVram();
+void UpdateNvidiaStats();
 void GetDetailedRamInfo();
 void InitDiskPdh();
 void UpdateDiskIo();

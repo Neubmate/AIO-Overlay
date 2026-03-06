@@ -121,7 +121,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
-      <AdditionalIncludeDirectories>C:\Users\User\Desktop\nvapi-main;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\User\Desktop\nvapi-main\amd64;C:\Users\User\Desktop\nvapi-main;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -137,7 +137,6 @@
     <ClCompile Include="gpu.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Nvidia.cpp" />
-    <ClCompile Include="Overlay.cpp" />
     <ClCompile Include="ram.cpp" />
     <ClCompile Include="storage.cpp" />
     <ClCompile Include="system.cpp" />

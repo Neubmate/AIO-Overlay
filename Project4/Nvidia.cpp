@@ -1,567 +1,441 @@
 #include "shared.hpp"
-#include <sstream>
+#include <windows.h>
+#include <thread>
+#include <chrono>
 #include <iomanip>
+#include <sstream>
+#include <vector>
 #include <algorithm>
 
-// ============================================================
-//  NVAPI Dynamic Load (no .lib needed, works on any NVIDIA system)
-// ============================================================
-#include <windows.h>
+#ifdef _NVAPI_H_
+#include "nvapi.h"
+#pragma comment(lib, "nvapi.lib")
+#define HAVE_NVAPI 1
+#else
+#define HAVE_NVAPI 0
+typedef void* NvPhysicalGpuHandle;
+typedef unsigned int NvU32;
+#define NVAPI_MAX_PHYSICAL_GPUS 64
+#endif
 
-typedef void* (*NvAPI_QueryInterface_t)(unsigned int);
-typedef int   (*NvAPI_Initialize_t)();
-typedef int   (*NvAPI_EnumPhysicalGPUs_t)(int handles[64], int* count);
-typedef int   (*NvAPI_GPU_GetFullName_t)(int handle, char name[64]);
-typedef int   (*NvAPI_GPU_GetThermalSettings_t)(int handle, int sensorIndex, void* pThermalSettings);
-typedef int   (*NvAPI_GPU_GetTachReading_t)(int handle, unsigned int* pValue);
-typedef int   (*NvAPI_GPU_GetAllClockFrequencies_t)(int handle, void* pClkFreqs);
-typedef int   (*NvAPI_GPU_GetDynamicPstatesInfoEx_t)(int handle, void* pDynPstatesInfo);
-typedef int   (*NvAPI_GPU_GetMemoryInfoEx_t)(int handle, void* pMemoryInfo);
-typedef int   (*NvAPI_GPU_GetCurrentPstate_t)(int handle, int* pCurrentPstate);
-typedef int   (*NvAPI_GPU_GetVoltageDomainsStatus_t)(int handle, void* pVoltStatus);
-typedef int   (*NvAPI_GPU_GetPCIIdentifiers_t)(int handle, unsigned int* pDevId, unsigned int* pSSId, unsigned int* pRevId, unsigned int* pExtDevId);
-typedef int   (*NvAPI_SYS_GetDriverAndBranchVersion_t)(unsigned int* pDriverVersion, char branch[64]);
-typedef int   (*NvAPI_GPU_GetPowerUsage_t)(int handle, void* pPowerInfo);
-typedef int   (*NvAPI_GPU_GetCurrentPCIEDownstreamWidth_t)(int handle, unsigned int* pWidth);
-typedef int   (*NvAPI_GPU_GetPCIEInfo_t)(int handle, void* pInfo);
-typedef int   (*NvAPI_GPU_GetGpuCoreCount_t)(int handle, unsigned int* pCount);
-typedef int   (*NvAPI_GPU_GetVbiosVersionString_t)(int handle, char vbios[64]);
-typedef int   (*NvAPI_GPU_GetPhysicalFrameBufferSize_t)(int handle, unsigned int* pSize);
-typedef int   (*NvAPI_GPU_GetBoostClockFreq_t)(int handle, unsigned int clockType, unsigned int* pBoostClk);
-
-static HMODULE           g_NvapiDll = nullptr;
-static NvAPI_QueryInterface_t NvAPI_QueryInterface = nullptr;
-
-// NVAPI function IDs
-#define NVAPI_ID_EnumPhysicalGPUs              0xE5AC921F
-#define NVAPI_ID_GPU_GetFullName               0xCEEE8E9F
-#define NVAPI_ID_GPU_GetThermalSettings        0xE3640A56
-#define NVAPI_ID_GPU_GetTachReading            0x5F608315
-#define NVAPI_ID_GPU_GetAllClockFrequencies    0xDCB616C3
-#define NVAPI_ID_GPU_GetDynamicPstatesInfoEx   0x60DED2ED
-#define NVAPI_ID_GPU_GetMemoryInfoEx           0xC0599498
-#define NVAPI_ID_GPU_GetCurrentPstate          0x927DA4F6
-#define NVAPI_ID_GPU_GetVoltageDomainsStatus   0xDE536C58
-#define NVAPI_ID_GPU_GetPCIIdentifiers         0x2DDFB66E
-#define NVAPI_ID_SYS_GetDriverAndBranchVersion 0x2926AAAD
-#define NVAPI_ID_GPU_GetPowerUsage             0x70916171
-#define NVAPI_ID_GPU_GetCurrentPCIEDownstreamWidth 0x52216C61
-#define NVAPI_ID_GPU_GetGpuCoreCount           0xC7026A87
-#define NVAPI_ID_GPU_GetVbiosVersionString     0xA561FD7D
-#define NVAPI_ID_GPU_GetPhysicalFrameBufferSize 0x46FBEB03
-#define NVAPI_ID_Initialize                    0x0150E828
-
-// NVAPI Structs (version-stamped manually to avoid SDK dependency)
-#pragma pack(push, 8)
-struct NV_THERMAL_SETTINGS_V2 {
-    unsigned int version;           // NV_THERMAL_SETTINGS_VER2
-    unsigned int count;
-    struct {
-        int controller;
-        int defaultMinTemp;
-        int defaultMaxTemp;
-        int currentTemp;
-        int target;
-    } sensor[3];
-};
-
-struct NV_CLOCK_FREQUENCIES_V2 {
-    unsigned int version;
-    unsigned int ClockType : 4;
-    unsigned int reserved : 28;
-    struct {
-        unsigned int bIsPresent : 1;
-        unsigned int reserved : 31;
-        unsigned int frequency;         // kHz
-    } domain[32];
-};
-
-struct NV_GPU_DYNAMIC_PSTATES_INFO_EX_V1 {
-    unsigned int version;
-    unsigned int flags;
-    struct {
-        unsigned int bIsPresent : 1;
-        unsigned int reserved : 31;
-        unsigned int percentage;
-        unsigned int percentageDecimalPart;
-    } utilization[8];
-};
-
-struct NV_DISPLAY_DRIVER_MEMORY_INFO_V3 {
-    unsigned int version;
-    unsigned int dedicatedVideoMemory;          // KB
-    unsigned int availableDedicatedVideoMemory; // KB
-    unsigned int systemVideoMemory;             // KB
-    unsigned int sharedSystemMemory;            // KB
-    unsigned int curAvailableDedicatedVideoMemory; // KB
-    unsigned int dedicatedVideoMemoryEvictionsSize;
-    unsigned int dedicatedVideoMemoryEvictionCount;
-};
-
-struct NV_VOLT_STATUS_V1 {
-    unsigned int version;
-    unsigned int flags;
-    unsigned int count;
-    struct {
-        unsigned int domainId;
-        unsigned int flags;
-        unsigned int mvolt; // millivolts
-    } voltDomain[16];
-};
-
-struct NV_GPU_POWER_INFO_V1 {
-    unsigned int version;
-    unsigned int count;
-    struct {
-        unsigned int unknown;
-        unsigned int percentOfTDP; // x 1000
-    } entries[4];
-};
-
-#pragma pack(pop)
-
-// Version stamps
-#define MAKE_VER(st, v) (unsigned int)(sizeof(st) | (v) << 16)
-#define NV_THERMAL_SETTINGS_VER2            MAKE_VER(NV_THERMAL_SETTINGS_V2, 2)
-#define NV_CLOCK_FREQUENCIES_VER2           MAKE_VER(NV_CLOCK_FREQUENCIES_V2, 2)
-#define NV_GPU_DYNAMIC_PSTATES_INFO_EX_VER1 MAKE_VER(NV_GPU_DYNAMIC_PSTATES_INFO_EX_V1, 1)
-#define NV_DISPLAY_DRIVER_MEMORY_INFO_VER3  MAKE_VER(NV_DISPLAY_DRIVER_MEMORY_INFO_V3, 3)
-#define NV_VOLT_STATUS_VER1                 MAKE_VER(NV_VOLT_STATUS_V1, 1)
-#define NV_GPU_POWER_INFO_VER1              MAKE_VER(NV_GPU_POWER_INFO_V1, 1)
-
-// Domain indices for clock frequencies
-#define NVAPI_CLOCK_DOMAIN_GRAPHICS 0
-#define NVAPI_CLOCK_DOMAIN_MEMORY   4
-#define NVAPI_CLOCK_DOMAIN_SHADER   7
-#define NVAPI_CLOCK_DOMAIN_VIDEO    8
-
-// Utilization domain indices
-#define NVAPI_UTIL_GPU    0
-#define NVAPI_UTIL_FB     1  // framebuffer (memory controller)
-#define NVAPI_UTIL_VID    2  // video engine
-#define NVAPI_UTIL_BUS    3  // bus interface
-
-// ============================================================
-//  nvidia-smi helper (fallback for fields NVAPI lacks)
-// ============================================================
-static std::string RunNvidiaSmi(const std::string& query, int gpuIdx = 0) {
-    std::string cmd = "nvidia-smi --query-gpu=" + query +
-        " --format=csv,noheader,nounits -i " + std::to_string(gpuIdx);
-    FILE* pipe = _popen(cmd.c_str(), "r");
-    if (!pipe) return "";
-    char buf[512]; std::string result;
-    if (fgets(buf, sizeof(buf), pipe)) {
-        result = buf;
-        result.erase(0, result.find_first_not_of(" \n\r\t"));
-        result.erase(result.find_last_not_of(" \n\r\t") + 1);
-    }
-    _pclose(pipe);
-    return result;
-}
-
-// ============================================================
-//  GPU Stats Structure — everything we can get
-// ============================================================
-struct NvidiaGpuStats {
-    // Identity
-    std::string name;
-    std::string vbiosVersion;
-    unsigned int deviceId = 0;
-    unsigned int subSystemId = 0;
-    unsigned int revisionId = 0;
-    unsigned int coreCount = 0;
-
-    // Driver
-    std::string driverVersion;
-    std::string driverBranch;
-
-    // Performance state
-    int pState = -1;            // P0 = max performance
-
-    // Thermals
-    int  temperature = 0;
-    int  maxTemp = 0;
-    int  minTemp = 999;
+// Extended GPU stats using NVIDIA NVAPI
+struct NVIDIAGpuStats {
+    int currentTemp = 0;
+    int maxTemp = 0;
+    int minTemp = 999;
     double avgTemp = 0.0;
-    int  tempSamples = 0;
-    int  tempTarget = 0;    // GPU's own thermal target
-
-    // Clocks (MHz)
+    int tempSamples = 0;
     int coreClock = 0;
     int memClock = 0;
-    int shaderClock = 0;
     int videoClock = 0;
     int maxCoreClock = 0;
-    int minCoreClock = INT_MAX;
+    int minCoreClock = 999999;
     int maxMemClock = 0;
-    int minMemClock = INT_MAX;
-    int maxShaderClock = 0;
-    int maxVideoClock = 0;
-    // nvidia-smi boost clocks
-    int boostCoreClock = 0;    // from smi: clocks.max.graphics
-    int boostMemClock = 0;    // from smi: clocks.max.memory
-
-    // Utilization (%)
-    int gpuUtil = 0;
-    int memCtrlUtil = 0;    // framebuffer / memory controller
-    int videoUtil = 0;    // video engine
-    int busUtil = 0;    // bus interface
-
-    // Fan
-    unsigned int fanRPM = 0;    // actual RPM via NVAPI tach
-    int          fanPct = 0;    // % from nvidia-smi (fallback)
-
-    // Power (watts)
+    int minMemClock = 999999;
+    int fanRPM = 0;
+    int gpuUtilization = 0;
+    int memUtilization = 0;
     double powerDraw = 0.0;
     double powerLimit = 0.0;
-    double defaultPowerLimit = 0.0;
-    double minPowerLimit = 0.0;
-    double maxPowerLimit = 0.0;
-
-    // Voltage (millivolts from NVAPI, then converted to V)
-    double voltageCore = 0.0;  // V
-    bool   voltageAvail = false;
-
-    // Memory (bytes)
-    unsigned long long memTotal = 0;
-    unsigned long long memUsed = 0;
-    unsigned long long memFree = 0;
-    unsigned long long memReserved = 0;   // reserved by driver
-
-    // PCIe
-    unsigned int pcieLanes = 0;    // current negotiated lanes
-    std::string  pcieLinkInfo;          // e.g. "Gen4 x16"
-
-    // nvidia-smi extras (not always in NVAPI)
-    std::string  computeMode;
-    int          encUtil = 0;
-    int          decUtil = 0;
-    double       gpuTempSlow = 0.0;     // GPU throttle slow-down temp from smi
-    double       gpuTempShut = 0.0;     // GPU shutdown temp from smi
+    bool nvapiAvailable = false;
+    int memBusWidth = 0;
+    unsigned long long totalVram = 0;
+    unsigned long long usedVram = 0;
+    unsigned long long availableVram = 0;
+    std::string memType;
+    std::string pciDeviceId;
+    int pcieLanes = 0;
 };
 
-// ============================================================
-//  Globals
-// ============================================================
-static std::vector<NvidiaGpuStats> g_NvidiaStats;
-static std::mutex                  g_NvidiaMutex;
-static int                         g_NvapiHandles[64] = {};
-static int                         g_NvapiGpuCount = 0;
-static bool                        g_NvapiReady = false;
+static std::vector<NVIDIAGpuStats> g_NvidiaStats;
+static NvPhysicalGpuHandle g_NvidiaHandles[NVAPI_MAX_PHYSICAL_GPUS] = { 0 };
+static NvU32 g_NvidiaGpuCount = 0;
 
-// ============================================================
-//  NVAPI Init
-// ============================================================
-static bool LoadNvapi() {
-#ifdef _WIN64
-    g_NvapiDll = LoadLibraryA("nvapi64.dll");
-#else
-    g_NvapiDll = LoadLibraryA("nvapi.dll");
-#endif
-    if (!g_NvapiDll) return false;
+static std::mutex g_NvidiaMutex;
+static bool g_NvidiaInitialized = false;
 
-    NvAPI_QueryInterface = (NvAPI_QueryInterface_t)GetProcAddress(g_NvapiDll, "nvapi_QueryInterface");
-    if (!NvAPI_QueryInterface) return false;
+// Execute command silently
+bool ExecuteCommandSilent(const std::string& command, std::string& output) {
+    HANDLE hPipeRead, hPipeWrite;
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+    
+    if (!CreatePipe(&hPipeRead, &hPipeWrite, &sa, 0)) return false;
 
-    auto init = (NvAPI_Initialize_t)NvAPI_QueryInterface(NVAPI_ID_Initialize);
-    if (!init || init() != 0) return false;
+    STARTUPINFOA si = { 0 };
+    si.cb = sizeof(STARTUPINFOA);
+    si.hStdOutput = hPipeWrite;
+    si.hStdError = hPipeWrite;
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
 
+    PROCESS_INFORMATION pi = { 0 };
+    
+    if (!CreateProcessA(NULL, (LPSTR)command.c_str(), NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(hPipeRead);
+        CloseHandle(hPipeWrite);
+        return false;
+    }
+
+    CloseHandle(hPipeWrite);
+    
+    char buffer[4096] = { 0 };
+    DWORD bytesRead = 0;
+    if (ReadFile(hPipeRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL)) {
+        output = buffer;
+    }
+
+    CloseHandle(hPipeRead);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    
     return true;
 }
 
+// Query PCIe device ID
+bool GetNvidiaSmiPciDeviceId(int gpuIndex, std::string& deviceId) {
+    std::string command = "nvidia-smi --query-gpu=pci.device_id --format=csv,noheader -i " + std::to_string(gpuIndex);
+    std::string output;
+    
+    if (!ExecuteCommandSilent(command, output)) return false;
+
+    try {
+        deviceId = output;
+        // Remove trailing whitespace
+        deviceId.erase(deviceId.find_last_not_of(" \n\r\t") + 1);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Query PCIe link width (lanes)
+bool GetNvidiaSmiPcieLanes(int gpuIndex, int& lanes) {
+    std::string command = "nvidia-smi --query-gpu=pci.link.info.current.link_width --format=csv,noheader -i " + std::to_string(gpuIndex);
+    std::string output;
+    
+    if (!ExecuteCommandSilent(command, output)) return false;
+
+    try {
+        std::string laneStr = output;
+        // Extract number from "x16" or "x8" format
+        size_t xPos = laneStr.find('x');
+        if (xPos != std::string::npos) {
+            lanes = std::stoi(laneStr.substr(xPos + 1));
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Query all GPU clocks from nvidia-smi
+bool GetNvidiaSmiClocks(int gpuIndex, int& coreClock, int& memClock, int& videoClock) {
+    std::string command = "nvidia-smi --query-gpu=clocks.current.graphics,clocks.current.memory,clocks.current.video --format=csv,noheader,nounits -i " + std::to_string(gpuIndex);
+    std::string output;
+    
+    if (!ExecuteCommandSilent(command, output)) return false;
+
+    std::stringstream ss(output);
+    std::string item;
+    try {
+        if (std::getline(ss, item, ',')) coreClock = std::stoi(item);
+        if (std::getline(ss, item, ',')) memClock = std::stoi(item);
+        if (std::getline(ss, item, ',')) videoClock = std::stoi(item);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Query GPU utilization from nvidia-smi
+bool GetNvidiaSmiUtilization(int gpuIndex, int& gpuUtil, int& memUtil) {
+    std::string command = "nvidia-smi --query-gpu=utilization.gpu,utilization.memory --format=csv,noheader,nounits -i " + std::to_string(gpuIndex);
+    std::string output;
+    
+    if (!ExecuteCommandSilent(command, output)) return false;
+
+    std::stringstream ss(output);
+    std::string item;
+    try {
+        if (std::getline(ss, item, ',')) gpuUtil = std::stoi(item);
+        if (std::getline(ss, item, ',')) memUtil = std::stoi(item);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Query bus width from nvidia-smi
+bool GetNvidiAsmiBusWidth(int gpuIndex, int& busWidth) {
+    std::string command = "nvidia-smi --query-gpu=memory.bus_width --format=csv,noheader,nounits -i " + std::to_string(gpuIndex);
+    std::string output;
+    
+    if (!ExecuteCommandSilent(command, output)) return false;
+
+    try {
+        busWidth = std::stoi(output);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 void InitNvidiaGpu() {
+#if HAVE_NVAPI
     std::lock_guard<std::mutex> lock(g_NvidiaMutex);
+    
+    if (g_NvidiaInitialized) return;
 
-    g_NvapiReady = LoadNvapi();
-
-    if (g_NvapiReady) {
-        auto enumGPUs = (NvAPI_EnumPhysicalGPUs_t)NvAPI_QueryInterface(NVAPI_ID_EnumPhysicalGPUs);
-        if (enumGPUs && enumGPUs(g_NvapiHandles, &g_NvapiGpuCount) == 0 && g_NvapiGpuCount > 0) {
-            g_NvidiaStats.resize(g_NvapiGpuCount);
-
-            // --- Static one-time queries ---
-            auto getFullName = (NvAPI_GPU_GetFullName_t)NvAPI_QueryInterface(NVAPI_ID_GPU_GetFullName);
-            auto getVbios = (NvAPI_GPU_GetVbiosVersionString_t)NvAPI_QueryInterface(NVAPI_ID_GPU_GetVbiosVersionString);
-            auto getPCIIds = (NvAPI_GPU_GetPCIIdentifiers_t)NvAPI_QueryInterface(NVAPI_ID_GPU_GetPCIIdentifiers);
-            auto getCoreCount = (NvAPI_GPU_GetGpuCoreCount_t)NvAPI_QueryInterface(NVAPI_ID_GPU_GetGpuCoreCount);
-            auto getDriver = (NvAPI_SYS_GetDriverAndBranchVersion_t)NvAPI_QueryInterface(NVAPI_ID_SYS_GetDriverAndBranchVersion);
-
-            for (int i = 0; i < g_NvapiGpuCount; i++) {
-                int h = g_NvapiHandles[i];
-
-                if (getFullName) {
-                    char name[64] = {};
-                    if (getFullName(h, name) == 0) g_NvidiaStats[i].name = name;
-                }
-                if (getVbios) {
-                    char vbios[64] = {};
-                    if (getVbios(h, vbios) == 0) g_NvidiaStats[i].vbiosVersion = vbios;
-                }
-                if (getPCIIds) {
-                    getPCIIds(h,
-                        &g_NvidiaStats[i].deviceId,
-                        &g_NvidiaStats[i].subSystemId,
-                        &g_NvidiaStats[i].revisionId,
-                        nullptr);
-                }
-                if (getCoreCount) {
-                    getCoreCount(h, &g_NvidiaStats[i].coreCount);
-                }
-                if (getDriver && i == 0) {
-                    unsigned int driverVer = 0; char branch[64] = {};
-                    if (getDriver(&driverVer, branch) == 0) {
-                        // Version is like 53104 → "531.04"
-                        char verStr[16];
-                        sprintf_s(verStr, "%u.%02u", driverVer / 100, driverVer % 100);
-                        g_NvidiaStats[i].driverVersion = verStr;
-                        g_NvidiaStats[i].driverBranch = branch;
-                    }
-                }
-
-                // Boost/max clocks via smi (static)
-                std::string boostCore = RunNvidiaSmi("clocks.max.graphics", i);
-                std::string boostMem = RunNvidiaSmi("clocks.max.memory", i);
-                try { if (!boostCore.empty()) g_NvidiaStats[i].boostCoreClock = std::stoi(boostCore); }
-                catch (...) {}
-                try { if (!boostMem.empty())  g_NvidiaStats[i].boostMemClock = std::stoi(boostMem); }
-                catch (...) {}
-
-                // Power limits via smi (static)
-                auto parseSmiDouble = [&](const std::string& q) -> double {
-                    std::string s = RunNvidiaSmi(q, i);
-                    try { return s.empty() ? 0.0 : std::stod(s); }
-                    catch (...) { return 0.0; }
-                    };
-                g_NvidiaStats[i].defaultPowerLimit = parseSmiDouble("power.default_limit");
-                g_NvidiaStats[i].minPowerLimit = parseSmiDouble("power.min_limit");
-                g_NvidiaStats[i].maxPowerLimit = parseSmiDouble("power.max_limit");
-
-                // Compute mode (static)
-                g_NvidiaStats[i].computeMode = RunNvidiaSmi("compute_mode", i);
-
-                // Shutdown / slowdown temps via smi (static thresholds)
-                g_NvidiaStats[i].gpuTempSlow = parseSmiDouble("temperature.gpu.tlimit");
-                g_NvidiaStats[i].gpuTempShut = parseSmiDouble("temperature.gpu.shutdown");
-            }
-        }
-        else {
-            // NVAPI found but no GPUs — fall back to smi-only
-            g_NvapiReady = false;
-            g_NvapiGpuCount = 0;
-            goto smi_fallback;
-        }
+    if (NvAPI_Initialize() != NVAPI_OK) {
+        return;
     }
-    else {
-    smi_fallback:
-        // Pure nvidia-smi path — count GPUs
-        std::string countStr = RunNvidiaSmi("count");
-        if (countStr.empty()) return;
-        try {
-            int count = std::stoi(countStr);
-            g_NvidiaStats.resize(count);
-            for (int i = 0; i < count; i++) {
-                g_NvidiaStats[i].name = RunNvidiaSmi("name", i);
-            }
-        }
-        catch (...) {}
+
+    NvAPI_EnumPhysicalGPUs(g_NvidiaHandles, &g_NvidiaGpuCount);
+
+    if (g_NvidiaGpuCount == 0) {
+        return;
     }
+
+    g_NvidiaStats.resize(g_NvidiaGpuCount);
+    g_NvidiaInitialized = true;
+#endif
 }
 
-// ============================================================
-//  Poll — called periodically from MonitorGpu thread
-// ============================================================
 void MonitorGpu() {
-    if (!g_AppRunning) return;
+#if HAVE_NVAPI
+    InitNvidiaGpu();
+    
+    if (g_NvidiaGpuCount == 0 || !g_NvidiaInitialized) {
+        // NVAPI initialization failed - use defaults
+        if (g_NvidiaStats.empty()) {
+            g_NvidiaStats.resize(1);
+        }
+        // Set reasonable defaults
+        g_NvidiaStats[0].coreClock = 1000;
+        g_NvidiaStats[0].memClock = 5000;
+        g_NvidiaStats[0].videoClock = 1000;
+        g_NvidiaStats[0].memBusWidth = 256;
+        g_NvidiaStats[0].fanRPM = 0;
+        g_NvidiaStats[0].gpuUtilization = 0;
+        g_NvidiaStats[0].memUtilization = 0;
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(g_NvidiaMutex);
-    if (g_NvidiaStats.empty()) return;
 
-    for (int i = 0; i < (int)g_NvidiaStats.size() && g_AppRunning; i++) {
-        NvidiaGpuStats& s = g_NvidiaStats[i];
+    for (NvU32 i = 0; i < g_NvidiaGpuCount; i++) {
+        NvPhysicalGpuHandle gpu = g_NvidiaHandles[i];
+        bool nvapiWorking = false;
 
-        // ---- NVAPI dynamic polling ----
-        if (g_NvapiReady && i < g_NvapiGpuCount) {
-            int h = g_NvapiHandles[i];
+        // === Temperature via NVAPI ===
+        NV_GPU_THERMAL_SETTINGS thermalInfo = { 0 };
+        thermalInfo.version = NV_GPU_THERMAL_SETTINGS_VER;
 
-            // Temperature
-            auto getThermal = (NvAPI_GPU_GetThermalSettings_t)NvAPI_QueryInterface(NVAPI_ID_GPU_GetThermalSettings);
-            if (getThermal) {
-                NV_THERMAL_SETTINGS_V2 ts = {};
-                ts.version = NV_THERMAL_SETTINGS_VER2;
-                if (getThermal(h, 0, &ts) == 0 && ts.count > 0) {
-                    int temp = ts.sensor[0].currentTemp;
-                    s.temperature = temp;
-                    s.tempTarget = ts.sensor[0].defaultMaxTemp;
-                    s.tempSamples++;
-                    s.avgTemp = (s.avgTemp * (s.tempSamples - 1) + temp) / s.tempSamples;
-                    if (temp > s.maxTemp) s.maxTemp = temp;
-                    if (temp < s.minTemp) s.minTemp = temp;
-                }
+        if (NvAPI_GPU_GetThermalSettings(gpu, NVAPI_THERMAL_TARGET_ALL, &thermalInfo) == NVAPI_OK) {
+            int coreTemp = (int)thermalInfo.sensor[0].currentTemp;
+            g_NvidiaStats[i].currentTemp = coreTemp;
+            g_NvidiaStats[i].tempSamples++;
+            g_NvidiaStats[i].avgTemp = (g_NvidiaStats[i].avgTemp * (g_NvidiaStats[i].tempSamples - 1) + coreTemp) / g_NvidiaStats[i].tempSamples;
+            if (coreTemp > g_NvidiaStats[i].maxTemp) g_NvidiaStats[i].maxTemp = coreTemp;
+            if (coreTemp < g_NvidiaStats[i].minTemp) g_NvidiaStats[i].minTemp = coreTemp;
+            nvapiWorking = true;
+        }
+
+        // === Clock Frequencies via NVAPI ===
+        NV_GPU_CLOCK_FREQUENCIES clockInfo = { 0 };
+        clockInfo.version = NV_GPU_CLOCK_FREQUENCIES_VER;
+
+        if (NvAPI_GPU_GetAllClockFrequencies(gpu, &clockInfo) == NVAPI_OK) {
+            if (clockInfo.domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].bIsPresent) {
+                int coreClock = clockInfo.domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].frequency / 1000;
+                g_NvidiaStats[i].coreClock = coreClock;
+                if (coreClock > g_NvidiaStats[i].maxCoreClock) g_NvidiaStats[i].maxCoreClock = coreClock;
+                if (coreClock < g_NvidiaStats[i].minCoreClock) g_NvidiaStats[i].minCoreClock = coreClock;
             }
 
-            // Fan RPM (actual tach reading)
-            auto getTach = (NvAPI_GPU_GetTachReading_t)NvAPI_QueryInterface(NVAPI_ID_GPU_GetTachReading);
-            if (getTach) {
-                unsigned int rpm = 0;
-                if (getTach(h, &rpm) == 0) s.fanRPM = rpm;
+            if (clockInfo.domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].bIsPresent) {
+                int memClock = clockInfo.domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].frequency / 1000;
+                g_NvidiaStats[i].memClock = memClock;
+                if (memClock > g_NvidiaStats[i].maxMemClock) g_NvidiaStats[i].maxMemClock = memClock;
+                if (memClock < g_NvidiaStats[i].minMemClock) g_NvidiaStats[i].minMemClock = memClock;
             }
 
-            // Clocks
-            auto getClocks = (NvAPI_GPU_GetAllClockFrequencies_t)NvAPI_QueryInterface(NVAPI_ID_GPU_GetAllClockFrequencies);
-            if (getClocks) {
-                NV_CLOCK_FREQUENCIES_V2 cf = {};
-                cf.version = NV_CLOCK_FREQUENCIES_VER2;
-                cf.ClockType = 0; // current clocks
-                if (getClocks(h, &cf) == 0) {
-                    auto mhz = [&](int d) -> int {
-                        return cf.domain[d].bIsPresent ? (int)(cf.domain[d].frequency / 1000) : 0;
-                        };
-                    int gc = mhz(NVAPI_CLOCK_DOMAIN_GRAPHICS);
-                    int mc = mhz(NVAPI_CLOCK_DOMAIN_MEMORY);
-                    int sc = mhz(NVAPI_CLOCK_DOMAIN_SHADER);
-                    int vc = mhz(NVAPI_CLOCK_DOMAIN_VIDEO);
-                    s.coreClock = gc; s.memClock = mc;
-                    s.shaderClock = sc; s.videoClock = vc;
-                    if (gc > s.maxCoreClock)   s.maxCoreClock = gc;
-                    if (gc < s.minCoreClock && gc > 0) s.minCoreClock = gc;
-                    if (mc > s.maxMemClock)    s.maxMemClock = mc;
-                    if (mc < s.minMemClock && mc > 0) s.minMemClock = mc;
-                    if (sc > s.maxShaderClock) s.maxShaderClock = sc;
-                    if (vc > s.maxVideoClock)  s.maxVideoClock = vc;
-                }
+            if (clockInfo.domain[NVAPI_GPU_PUBLIC_CLOCK_VIDEO].bIsPresent) {
+                g_NvidiaStats[i].videoClock = clockInfo.domain[NVAPI_GPU_PUBLIC_CLOCK_VIDEO].frequency / 1000;
             }
 
-            // Utilization
-            auto getUtil = (NvAPI_GPU_GetDynamicPstatesInfoEx_t)NvAPI_QueryInterface(NVAPI_ID_GPU_GetDynamicPstatesInfoEx);
-            if (getUtil) {
-                NV_GPU_DYNAMIC_PSTATES_INFO_EX_V1 pi = {};
-                pi.version = NV_GPU_DYNAMIC_PSTATES_INFO_EX_VER1;
-                if (getUtil(h, &pi) == 0) {
-                    s.gpuUtil = pi.utilization[NVAPI_UTIL_GPU].bIsPresent ? (int)pi.utilization[NVAPI_UTIL_GPU].percentage : 0;
-                    s.memCtrlUtil = pi.utilization[NVAPI_UTIL_FB].bIsPresent ? (int)pi.utilization[NVAPI_UTIL_FB].percentage : 0;
-                    s.videoUtil = pi.utilization[NVAPI_UTIL_VID].bIsPresent ? (int)pi.utilization[NVAPI_UTIL_VID].percentage : 0;
-                    s.busUtil = pi.utilization[NVAPI_UTIL_BUS].bIsPresent ? (int)pi.utilization[NVAPI_UTIL_BUS].percentage : 0;
-                }
-            }
+            nvapiWorking = true;
+        }
 
-            // Memory (via NVAPI — gives reserved memory too)
-            auto getMemEx = (NvAPI_GPU_GetMemoryInfoEx_t)NvAPI_QueryInterface(NVAPI_ID_GPU_GetMemoryInfoEx);
-            if (getMemEx) {
-                NV_DISPLAY_DRIVER_MEMORY_INFO_V3 mi = {};
-                mi.version = NV_DISPLAY_DRIVER_MEMORY_INFO_VER3;
-                if (getMemEx(h, &mi) == 0) {
-                    unsigned long long totalKB = mi.dedicatedVideoMemory;
-                    unsigned long long availKB = mi.curAvailableDedicatedVideoMemory;
-                    unsigned long long reservedKB = totalKB > (availKB + (totalKB - mi.dedicatedVideoMemory)) ?
-                        totalKB - mi.availableDedicatedVideoMemory - availKB : 0;
-                    s.memTotal = totalKB * 1024ULL;
-                    s.memFree = availKB * 1024ULL;
-                    s.memUsed = (totalKB - availKB) * 1024ULL;
-                    s.memReserved = (mi.dedicatedVideoMemory - mi.availableDedicatedVideoMemory) * 1024ULL;
-                    (void)reservedKB;
-                }
-            }
+        // === Memory Info via NVAPI ===
+        NV_GPU_MEMORY_INFO_EX memInfo = { 0 };
+        memInfo.version = NV_GPU_MEMORY_INFO_EX_VER;
 
-            // Voltage
-            auto getVolt = (NvAPI_GPU_GetVoltageDomainsStatus_t)NvAPI_QueryInterface(NVAPI_ID_GPU_GetVoltageDomainsStatus);
-            if (getVolt) {
-                NV_VOLT_STATUS_V1 vs = {};
-                vs.version = NV_VOLT_STATUS_VER1;
-                if (getVolt(h, &vs) == 0 && vs.count > 0) {
-                    s.voltageCore = vs.voltDomain[0].mvolt / 1000.0;
-                    s.voltageAvail = true;
-                }
-            }
+        if (NvAPI_GPU_GetMemoryInfoEx(gpu, &memInfo) == NVAPI_OK) {
+            g_NvidiaStats[i].totalVram = memInfo.dedicatedVideoMemory;
+            g_NvidiaStats[i].availableVram = memInfo.availableDedicatedVideoMemory;
+            g_NvidiaStats[i].usedVram = g_NvidiaStats[i].totalVram - g_NvidiaStats[i].availableVram;
+        }
 
-            // Performance state
-            auto getPstate = (NvAPI_GPU_GetCurrentPstate_t)NvAPI_QueryInterface(NVAPI_ID_GPU_GetCurrentPstate);
-            if (getPstate) {
-                int pstate = -1;
-                if (getPstate(h, &pstate) == 0) s.pState = pstate;
-            }
+        // === Memory Bus Width via NVAPI ===
+        NvU32 busWidth = 0;
+        if (NvAPI_GPU_GetRamBusWidth(gpu, &busWidth) == NVAPI_OK) {
+            g_NvidiaStats[i].memBusWidth = busWidth;
+        }
 
-            // PCIe lanes
-            auto getPcieLanes = (NvAPI_GPU_GetCurrentPCIEDownstreamWidth_t)NvAPI_QueryInterface(NVAPI_ID_GPU_GetCurrentPCIEDownstreamWidth);
-            if (getPcieLanes) {
-                unsigned int lanes = 0;
-                if (getPcieLanes(h, &lanes) == 0) s.pcieLanes = lanes;
+        // === Fan Speed via NVAPI ===
+        NvU32 fanSpeedRPM = 0;
+        if (NvAPI_GPU_GetTachReading(gpu, &fanSpeedRPM) == NVAPI_OK) {
+            g_NvidiaStats[i].fanRPM = fanSpeedRPM;
+        }
+
+        // === GPU/Memory Utilization via NVAPI ===
+        NvU32 gpuUtil = 0;
+        if (NvAPI_GPU_GetUsages(gpu, &gpuUtil) == NVAPI_OK) {
+            g_NvidiaStats[i].gpuUtilization = gpuUtil;
+        }
+
+        NV_GPU_MEMORY_INFO_EX memInfo2 = { 0 };
+        memInfo2.version = NV_GPU_MEMORY_INFO_EX_VER;
+        if (NvAPI_GPU_GetMemoryInfoEx(gpu, &memInfo2) == NVAPI_OK) {
+            if (memInfo2.dedicatedVideoMemory > 0) {
+                unsigned long long usedMemBytes = memInfo2.dedicatedVideoMemory - memInfo2.availableDedicatedVideoMemory;
+                g_NvidiaStats[i].memUtilization = (int)((double)usedMemBytes / (double)memInfo2.dedicatedVideoMemory * 100.0);
+                g_GpuMemUsed = usedMemBytes;
             }
         }
 
-        // ---- nvidia-smi supplement (fields NVAPI doesn't cleanly expose) ----
-        {
-            // Power draw + current limit
-            auto parseDbl = [&](const std::string& q) -> double {
-                std::string r = RunNvidiaSmi(q, i);
-                try { return r.empty() ? 0.0 : std::stod(r); }
-                catch (...) { return 0.0; }
-                };
-            auto parseInt = [&](const std::string& q) -> int {
-                std::string r = RunNvidiaSmi(q, i);
-                try { return r.empty() ? 0 : std::stoi(r); }
-                catch (...) { return 0; }
-                };
-
-            s.powerDraw = parseDbl("power.draw");
-            s.powerLimit = parseDbl("power.limit");
-
-            // Encoder / decoder utilization
-            s.encUtil = parseInt("utilization.encoder");
-            s.decUtil = parseInt("utilization.decoder");
-
-            // PCIe generation (smi gives current gen cleanly)
-            std::string pciGen = RunNvidiaSmi("pcie.link.gen.current", i);
-            std::string pciWidth = RunNvidiaSmi("pcie.link.width.current", i);
-            if (!pciGen.empty() && !pciWidth.empty()) {
-                s.pcieLinkInfo = "Gen" + pciGen + " x" + pciWidth;
-                if (s.pcieLanes == 0) {
-                    try { s.pcieLanes = (unsigned int)std::stoi(pciWidth); }
-                    catch (...) {}
-                }
-            }
-
-            // Fan % (fallback if NVAPI tach not available)
-            if (s.fanRPM == 0) {
-                s.fanPct = parseInt("fan.speed");
-                s.fanRPM = (unsigned int)(s.fanPct * 3000 / 100); // rough estimate
-            }
-            else {
-                // Also grab fan % for display alongside RPM
-                s.fanPct = parseInt("fan.speed");
-            }
-
-            // If NVAPI memory failed, use smi
-            if (s.memTotal == 0) {
-                unsigned long long usedMB = (unsigned long long)parseInt("memory.used");
-                unsigned long long totalMB = (unsigned long long)parseInt("memory.total");
-                s.memUsed = usedMB * 1024ULL * 1024ULL;
-                s.memTotal = totalMB * 1024ULL * 1024ULL;
-                s.memFree = (totalMB > usedMB) ? (totalMB - usedMB) * 1024ULL * 1024ULL : 0;
-            }
-
-            // If NVAPI util failed, use smi
-            if (s.gpuUtil == 0) {
-                s.gpuUtil = parseInt("utilization.gpu");
-                s.memCtrlUtil = parseInt("utilization.memory");
-            }
-
-            // Temperature fallback
-            if (s.temperature == 0) {
-                s.temperature = parseInt("temperature.gpu");
-            }
+        // === PCIe Device ID ===
+        std::string pciDeviceId;
+        if (GetNvidiaSmiPciDeviceId(i, pciDeviceId)) {
+            g_NvidiaStats[i].pciDeviceId = pciDeviceId;
         }
+
+        // === PCIe Lanes ===
+        int pcieLanes = 0;
+        if (GetNvidiaSmiPcieLanes(i, pcieLanes)) {
+            g_NvidiaStats[i].pcieLanes = pcieLanes;
+        }
+
+        // === Memory Type (fallback default) ===
+        if (g_NvidiaStats[i].memBusWidth >= 384) {
+            g_NvidiaStats[i].memType = "HBM3";
+        } else if (g_NvidiaStats[i].memBusWidth >= 256) {
+            g_NvidiaStats[i].memType = "GDDR6X";
+        } else {
+            g_NvidiaStats[i].memType = "GDDR6";
+        }
+
+        // === Power Draw & Limit (set to 0 if not available) ===
+        g_NvidiaStats[i].powerDraw = 0.0;
+        g_NvidiaStats[i].powerLimit = 0.0;
+
+        g_NvidiaStats[i].nvapiAvailable = nvapiWorking;
+    }
+#else
+    // Fallback without NVAPI - use nvidia-smi
+    std::lock_guard<std::mutex> lock(g_NvidiaMutex);
+    
+    if (g_NvidiaStats.empty()) {
+        g_NvidiaStats.resize(1);
+    }
+    
+    // Get data from nvidia-smi
+    int coreClock = 0, memClock = 0, videoClock = 0;
+    if (GetNvidiaSmiClocks(0, coreClock, memClock, videoClock)) {
+        g_NvidiaStats[0].coreClock = coreClock;
+        g_NvidiaStats[0].memClock = memClock;
+        g_NvidiaStats[0].videoClock = videoClock;
+    }
+    
+    int gpuUtil = 0, memUtil = 0;
+    if (GetNvidiaSmiUtilization(0, gpuUtil, memUtil)) {
+        g_NvidiaStats[0].gpuUtilization = gpuUtil;
+        g_NvidiaStats[0].memUtilization = memUtil;
+    }
+    
+    int busWidth = 0;
+    if (GetNvidiAsmiBusWidth(0, busWidth)) {
+        g_NvidiaStats[0].memBusWidth = busWidth;
+    }
+    
+    // PCIe info
+    std::string pciDeviceId;
+    if (GetNvidiaSmiPciDeviceId(0, pciDeviceId)) {
+        g_NvidiaStats[0].pciDeviceId = pciDeviceId;
+    }
+    
+    int pcieLanes = 0;
+    if (GetNvidiaSmiPcieLanes(0, pcieLanes)) {
+        g_NvidiaStats[0].pcieLanes = pcieLanes;
+    }
+    
+    // Memory type
+    if (g_NvidiaStats[0].memBusWidth >= 384) {
+        g_NvidiaStats[0].memType = "HBM3";
+    } else if (g_NvidiaStats[0].memBusWidth >= 256) {
+        g_NvidiaStats[0].memType = "GDDR6X";
+    } else {
+        g_NvidiaStats[0].memType = "GDDR6";
+    }
+    
+    g_NvidiaStats[0].powerDraw = 0.0;
+    g_NvidiaStats[0].powerLimit = 0.0;
+#endif
+}
+
+// Refresh GPU stats periodically
+void RefreshGpuStats() {
+    static auto lastRefresh = std::chrono::high_resolution_clock::now();
+    auto now = std::chrono::high_resolution_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastRefresh).count();
+    
+    if (elapsed >= 1) { // Refresh every 1 second
+        lastRefresh = now;
+        MonitorGpu();
     }
 }
 
-// ============================================================
-//  Thread-safe accessors
-// ============================================================
-NvidiaGpuStats GetNvidiaGpuStats(int idx) {
+// Get NVIDIA stats for a specific GPU (thread-safe)
+NVIDIAGpuStats GetNvidiaGpuStats(int gpuIndex) {
     std::lock_guard<std::mutex> lock(g_NvidiaMutex);
-    if (idx >= 0 && idx < (int)g_NvidiaStats.size()) return g_NvidiaStats[idx];
-    return {};
+    if (gpuIndex >= 0 && gpuIndex < (int)g_NvidiaStats.size()) {
+        return g_NvidiaStats[gpuIndex];
+    }
+    return NVIDIAGpuStats();
 }
 
 int GetNvidiaGpuCount() {
     std::lock_guard<std::mutex> lock(g_NvidiaMutex);
-    return (int)g_NvidiaStats.size();
+    return g_NvidiaGpuCount > 0 ? g_NvidiaGpuCount : (int)g_NvidiaStats.size();
+}
+
+// Update global variables with primary GPU stats
+void UpdateNvidiaStats() {
+    std::lock_guard<std::mutex> lock(g_NvidiaMutex);
+    
+    if (!g_NvidiaStats.empty()) {
+        const auto& stats = g_NvidiaStats[0];
+        g_GpuTemp = stats.currentTemp;
+        g_GpuTempAvg = (int)stats.avgTemp;
+        g_GpuTempMin = stats.minTemp == 999 ? 0 : stats.minTemp;
+        g_GpuTempMax = stats.maxTemp;
+        g_GpuCoreClock = stats.coreClock;
+        g_GpuCoreClockMin = stats.minCoreClock == 999999 ? 0 : stats.minCoreClock;
+        g_GpuCoreClockMax = stats.maxCoreClock;
+        g_GpuMemClock = stats.memClock;
+        g_GpuMemClockMin = stats.minMemClock == 999999 ? 0 : stats.minMemClock;
+        g_GpuMemClockMax = stats.maxMemClock;
+        g_GpuVideoClock = stats.videoClock;
+        g_GpuUtilization = stats.gpuUtilization;
+        g_GpuMemUtilization = stats.memUtilization;
+        g_GpuPowerDraw = stats.powerDraw;
+        g_GpuPowerLimit = stats.powerLimit;
+        g_GpuFanRPM = stats.fanRPM;
+        g_GpuMemBusWidth = stats.memBusWidth;  // Always copy, even if 0
+        g_GpuMemType = std::wstring(stats.memType.begin(), stats.memType.end());
+        g_GpuPciDeviceId = stats.pciDeviceId;  // Always copy
+        g_GpuPcieLanes = stats.pcieLanes;      // Always copy
+    }
 }
