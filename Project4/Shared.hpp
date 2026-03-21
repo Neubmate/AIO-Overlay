@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <windows.h>
 #include <iostream>
 #include <string>
@@ -78,7 +78,34 @@ extern int g_GpuPcieLanes;
 extern std::wstring g_MoboName;
 extern std::wstring g_BiosWmi;
 extern std::wstring g_UpgradePath;
-extern std::wstring g_BiosAnalysis;
+
+// CPU Core Clock Customization
+extern int g_CpuClock;
+extern int g_CpuTdp;
+extern std::wstring g_RamTimings;
+extern int g_SelectedCoreIndex;
+extern int g_TargetCoreClock;
+
+// Function declarations
+bool SetCpuCoreClock(int core, int mhz);
+void UpdateCpuAndRamInfo();
+
+// ZenStates-Core CPU Info exports
+extern "C" {
+    const char* GetCpuNameNative();
+    unsigned int GetCpuFamilyNative();
+    unsigned int GetCpuCodeNameNative();
+    unsigned int GetPackageTypeNative();
+    unsigned int GetCcdsNative();
+    unsigned int GetCcxsNative();
+    unsigned int GetCoresPerCcxNative();
+    unsigned int GetLogicalCoresNative();
+    unsigned int GetPhysicalCoresNative();
+    unsigned int GetPatchLevelNative();
+    unsigned int GetSvi2CoreAddressNative();
+    unsigned int GetSvi2SocAddressNative();
+}
+
 extern std::wstring g_AgesaVersion;
 
 extern int g_GlobalThreads;
@@ -136,6 +163,24 @@ void UpdateBattery();
 // SIO
 bool InitFanControl();
 void SetFanSpeed(int pct);
+
+// SmuBridge
+extern std::wstring g_SmuCpuName;
+extern std::wstring g_SmuCpuId;
+extern std::wstring g_SmuModel;
+extern std::wstring g_SmuPackage;
+extern std::wstring g_SmuConfig;
+extern std::wstring g_SmuMobo;
+extern std::wstring g_SmuBios;
+extern std::wstring g_SmuVersion;
+extern std::wstring g_SmuPatch;
+extern std::wstring g_SmuTemp;
+extern std::wstring g_SmuAcfResult;
+extern bool         g_SmuReady;
+extern bool         g_SmuProchot;
+bool InitSmuBridge();
+bool SmuSetAllCoreFrequency(int mhz);
+std::string SmuGetRawOutput();
 
 class WmiQuery {
 public:

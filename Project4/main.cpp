@@ -1,4 +1,4 @@
-#include "shared.hpp"
+﻿#include "shared.hpp"
 #include <gdiplus.h>
 #include <fcntl.h>
 #include <io.h>
@@ -53,8 +53,11 @@ RECT g_RectMultiCore = { 0 }, g_RectSingleCore = { 0 }, g_RectGpuTest = { 0 };
 RECT g_RectCpuBurn = { 0 }, g_RectRamBurn = { 0 }, g_RectGpuBurn = { 0 };
 RECT g_RectFanControl = { 0 };
 
-// --- SLIDER STATE ---
-bool g_DraggingFan = false; // Tracks if user is holding the slider
+// --- CORE CLOCK INPUT STATE ---
+bool g_EditingCoreClk = false;
+int g_SelectedCore = 0;
+std::wstring g_CoreClkInput = L"";
+RECT g_RectCoreClkInput = { 0 };
 
 void SaveSettings() {
 }
@@ -128,10 +131,45 @@ void DrawAppleUI(Gdiplus::Graphics* g, int w, int h) {
     wchar_t buf[512];
 
     if (g_Cfg.showCpu) {
-        DrawStr(g, g_CpuName.c_str(), &fBody, x, y, &bWhite); y += 18.0f;
+        // CPU name: prefer SmuBridge name (more detailed), fall back to WMI name
+        DrawStr(g, g_SmuReady && !g_SmuCpuName.empty() ? g_SmuCpuName.c_str() : g_CpuName.c_str(), &fBody, x, y, &bWhite); y += 18.0f;
         DrawPillBar(g, x, y, contentW, 8, g_CpuUsage / 100.0f, (g_CpuTemp > 85) ? &bRed : &bBlue, &bTrack); y += 12.0f;
         swprintf_s(buf, L"%d%% Load  \u2022  %d\u00B0C Temp  \u2022  %d Thr", g_CpuUsage, g_CpuTemp, g_GlobalThreads);
-        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 20.0f;
+        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 16.0f;
+
+        // Prochot + SMU temp
+        if (g_SmuReady) {
+            if (g_SmuProchot) {
+                Gdiplus::SolidBrush bHot(Gdiplus::Color(255, 255, 69, 58));
+                DrawStr(g, L"\u26A0 PROCHOT: THROTTLING", &fSmall, x, y, &bHot);
+            } else {
+                Gdiplus::SolidBrush bOk(Gdiplus::Color(255, 46, 204, 113));
+                DrawStr(g, L"\u2714 PROCHOT: OK", &fSmall, x, y, &bOk);
+            }
+            if (!g_SmuTemp.empty()) {
+                swprintf_s(buf, L"  \u2022  %s\u00B0C", g_SmuTemp.c_str());
+                DrawStr(g, buf, &fSmall, x + 140, y, &bGray);
+            }
+        } else {
+            DrawStr(g, L"PROCHOT: initializing...", &fSmall, x, y, &bGray);
+        }
+        y += 14.0f;
+
+        // Config + board + SMU version
+        if (g_SmuReady) {
+            if (!g_SmuConfig.empty())  { DrawStr(g, g_SmuConfig.c_str(),  &fSmall, x, y, &bGray); y += 12.0f; }
+            if (!g_SmuMobo.empty())    { DrawStr(g, g_SmuMobo.c_str(),    &fSmall, x, y, &bGray); y += 12.0f; }
+            if (!g_SmuVersion.empty()) {
+                swprintf_s(buf, L"SMU %s  \u2022  Patch %s", g_SmuVersion.c_str(), g_SmuPatch.c_str());
+                DrawStr(g, buf, &fSmall, x, y, &bGray); y += 12.0f;
+            }
+            if (!g_SmuAcfResult.empty()) {
+                Gdiplus::SolidBrush bAcf(g_SmuAcfResult.find(L"OK") != std::wstring::npos
+                    ? Gdiplus::Color(255, 46, 204, 113) : Gdiplus::Color(255, 255, 69, 58));
+                DrawStr(g, g_SmuAcfResult.c_str(), &fSmall, x, y, &bAcf); y += 12.0f;
+            }
+        }
+        y += 6.0f;
     }
 
     if (g_Cfg.showCores && !g_CoreLoad.empty()) {
@@ -145,77 +183,77 @@ void DrawAppleUI(Gdiplus::Graphics* g, int w, int h) {
         if (col != 0) y += 8.0f; y += 10.0f;
     }
 
-    // --- MOTHERBOARD DETAILS ---
-    bool fanReady = InitFanControl();
-    if (fanReady) {
-        DrawStr(g, L"Motherboard (NCT6687D)", &fBody, x, y, &bWhite); y += 18.0f;
+    // All-core frequency control
+    {
+        DrawStr(g, L"All-Core Frequency", &fBody, x, y, &bWhite); y += 18.0f;
 
-        if (g_DetectedChipID != 0) {
-            swprintf_s(buf, L"ID: %04X (Found)", g_DetectedChipID);
-            DrawStr(g, buf, &fSmall, x, y, &bGreen); y += 14.0f;
+        // Input box
+        g_RectCoreClkInput = { (int)x, (int)y, (int)(x + contentW), (int)(y + 28) };
+        Gdiplus::SolidBrush bInputBg(g_EditingCoreClk
+            ? Gdiplus::Color(160, 0, 80, 160)
+            : Gdiplus::Color(80, 50, 50, 60));
+        Gdiplus::Pen pInputBorder(g_EditingCoreClk
+            ? Gdiplus::Color(200, 10, 132, 255)
+            : Gdiplus::Color(60, 255, 255, 255), 1);
+        DrawRoundedRect(g, &bInputBg, &pInputBorder,
+            g_RectCoreClkInput.left, g_RectCoreClkInput.top,
+            (int)contentW, 28, 6);
 
-            swprintf_s(buf, L"CPU: %.3fV  SoC: %.3fV  DRAM: %.3fV", g_VoltVCore, g_VoltSoC, g_VoltDram);
-            DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
+        if (g_EditingCoreClk)
+            swprintf_s(buf, L"  %s_  (550-7000 MHz, x25)", g_CoreClkInput.c_str());
+        else
+            swprintf_s(buf, L"  Click here, type MHz, press Enter");
 
-            swprintf_s(buf, L"+12V: %.2fV  +5V: %.2fV", g_Volt12V, g_Volt5V);
-            DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
+        Gdiplus::RectF inputRect((float)g_RectCoreClkInput.left,
+                                  (float)g_RectCoreClkInput.top + 6,
+                                  contentW, 20);
+        Gdiplus::StringFormat fmt;
+        g->DrawString(buf, -1, &fSmall, inputRect, &fmt, &bWhite);
+        y += 34.0f;
 
-            swprintf_s(buf, L"VRM: %d\u00B0C  Sys: %d\u00B0C  PCH: %d\u00B0C", g_TempVRM, g_TempSystem, g_TempPCH);
-            DrawStr(g, buf, &fSmall, x, y, &bGray); y += 20.0f;
+        // Last ACF result
+        if (!g_SmuAcfResult.empty()) {
+            Gdiplus::SolidBrush bAcf(g_SmuAcfResult.find(L"OK") != std::wstring::npos
+                ? Gdiplus::Color(255, 46, 204, 113)
+                : Gdiplus::Color(255, 255, 69, 58));
+            DrawStr(g, g_SmuAcfResult.c_str(), &fSmall, x, y, &bAcf); y += 14.0f;
         }
-        else {
-            // Debug: Show why it failed
-            swprintf_s(buf, L"Scanning... Last: %04X", g_DebugID);
-            DrawStr(g, buf, &fSmall, x, y, &bRed); y += 20.0f;
-        }
+        y += 4.0f;
     }
 
     if (g_Cfg.showGpu) {
         DrawStr(g, g_GpuName.c_str(), &fBody, x, y, &bWhite); y += 18.0f;
-        
-        // Clock Information - Always show
-        swprintf_s(buf, L"Core Clock: %d MHz  (Min: %d  Max: %d)", 
-                   g_GpuCoreClock, g_GpuCoreClockMin == 999999 ? 0 : g_GpuCoreClockMin, g_GpuCoreClockMax);
+
+        // GPU Temperature
+        DrawPillBar(g, x, y, contentW, 8, g_GpuTemp / 100.0f, (g_GpuTemp > 85) ? &bRed : &bBlue, &bTrack); y += 12.0f;
+        swprintf_s(buf, L"%d°C Temp  •  %d%% GPU Util  •  %d%% Mem Util", g_GpuTemp, g_GpuUtilization, g_GpuMemUtilization);
+        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 20.0f;
+
+        // Clock Information
+        swprintf_s(buf, 512, L"Core: %d MHz (Min: %d Max: %d)  •  Mem: %d MHz", 
+                   g_GpuCoreClock, 
+                   g_GpuCoreClockMin == 999999 ? 0 : g_GpuCoreClockMin, 
+                   g_GpuCoreClockMax);
         DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
-        
-        swprintf_s(buf, L"Memory Clock: %d MHz  (Min: %d  Max: %d)", 
-                   g_GpuMemClock, g_GpuMemClockMin == 999999 ? 0 : g_GpuMemClockMin, g_GpuMemClockMax);
+
+        swprintf_s(buf, 512, L"Memory: %d MHz (Min: %d Max: %d)", 
+                   g_GpuMemClock, 
+                   g_GpuMemClockMin == 999999 ? 0 : g_GpuMemClockMin, 
+                   g_GpuMemClockMax);
         DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
-        
-        swprintf_s(buf, L"Video Clock: %d MHz  (Min: %d  Max: %d)", g_GpuVideoClock, 0, 0);
-        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
-        
-        // Bus Width - Always show
-        swprintf_s(buf, L"Bus Width: %d-bit", g_GpuMemBusWidth);
-        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
-        
-        // Power - Always show
+
+        // Power and Fan
         Gdiplus::SolidBrush bPowerColor(g_GpuPowerDraw > (g_GpuPowerLimit * 0.9) ? Gdiplus::Color(255, 255, 204, 0) : 
                                         Gdiplus::Color(255, 46, 204, 113));
-        swprintf_s(buf, L"Power: %.1fW / %.1fW  Fan: %d RPM", g_GpuPowerDraw, g_GpuPowerLimit, g_GpuFanRPM);
+        swprintf_s(buf, L"Power: %.1fW / %.1fW  •  Fan: %d RPM", g_GpuPowerDraw, g_GpuPowerLimit, g_GpuFanRPM);
         DrawStr(g, buf, &fSmall, x, y, &bPowerColor); y += 14.0f;
-        
-        // PCIe Information - Always show
-        std::wstring pciInfo = L"PCIe: ";
-        if (g_GpuPcieLanes > 0) {
-            wchar_t laneBuf[32];
-            swprintf_s(laneBuf, L"x%d", g_GpuPcieLanes);
-            pciInfo += laneBuf;
-        } else {
-            pciInfo += L"Unknown";
-        }
-        if (!g_GpuPciDeviceId.empty()) {
-            pciInfo += L"  ID: ";
-            size_t newsize = g_GpuPciDeviceId.size() + 1;
-            wchar_t* wcstring = new wchar_t[newsize];
-            size_t convertedChars = 0;
-            mbstowcs_s(&convertedChars, wcstring, newsize, g_GpuPciDeviceId.c_str(), _TRUNCATE);
-            pciInfo += wcstring;
-            delete[] wcstring;
-        }
-        DrawStr(g, pciInfo.c_str(), &fSmall, x, y, &bGray); y += 14.0f;
-        
-        y += 10.0f;
+
+        // VRAM Info (simplified)
+        double vramUsedGB = g_GpuVramUsed / (1024.0 * 1024.0 * 1024.0);
+        double vramTotalGB = g_GpuVramTotal / (1024.0 * 1024.0 * 1024.0);
+        float vramPct = vramTotalGB > 0 ? (vramUsedGB / vramTotalGB) : 0.0f;
+        swprintf_s(buf, L"VRAM: %.1f/%.1f GB", vramUsedGB, vramTotalGB);
+        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
     }
 
     if (g_Cfg.showDrives) {
@@ -226,28 +264,18 @@ void DrawAppleUI(Gdiplus::Graphics* g, int w, int h) {
         y += 8.0f;
     }
 
+    if (g_Cfg.showRam) {
+        DrawStr(g, L"Memory", &fBody, x, y, &bWhite); y += 18.0f;
+        DrawPillBar(g, x, y, contentW, 8, g_RamLoad / 100.0f, (g_RamLoad > 80) ? &bRed : &bGreen, &bTrack); y += 12.0f;
+        swprintf_s(buf, L"%s  •  %d%% Load", g_RamText.c_str(), g_RamLoad);
+        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 20.0f;
+    }
+
     if (g_Cfg.showBattery && g_HasBattery) {
         DrawStr(g, L"Battery", &fBody, x, y, &bWhite); y += 18.0f;
         DrawPillBar(g, x, y, contentW, 8, g_BatteryPct / 100.0f, g_BatteryPct < 20 ? &bRed : &bGreen, &bTrack);
         swprintf_s(buf, L"%d%% (%s)", g_BatteryPct, g_BatteryTime.c_str());
         y += 12.0f; DrawStr(g, buf, &fSmall, x, y, &bGray); y += 20.0f;
-    }
-
-    // --- FAN CONTROL SLIDER ---
-    DrawStr(g, L"Fan Control", &fBody, x, y, fanReady ? &bGreen : &bRed); y += 18.0f;
-    if (fanReady) {
-        swprintf_s(buf, L"%d RPM  \u2022  Target %d%%", g_FanRPM, g_FanSpeedPct);
-        DrawStr(g, buf, &fSmall, x, y, &bGray); y += 14.0f;
-
-        // Draw Slider Pill
-        DrawPillBar(g, x, y, contentW, 8, g_FanSpeedPct / 100.0f, g_DraggingFan ? &bWhite : &bYellow, &bTrack);
-
-        // Save Click Rect
-        g_RectFanControl = { (long)x, (long)y, (long)(x + contentW), (long)(y + 8) };
-        y += 20.0f;
-    }
-    else {
-        DrawStr(g, L"Driver Missing (Run as Admin)", &fSmall, x, y, &bGray); y += 20.0f;
     }
 
     y += 10.0f;
@@ -292,29 +320,17 @@ void DrawAppleUI(Gdiplus::Graphics* g, int w, int h) {
     g_RectGpuBurn = { (long)(x + (stressW * 2) + 20), (long)y, (long)(x + (stressW * 2) + 20 + stressW), (long)(y + BTN_HEIGHT) };
 }
 
-bool IsPointInRect(int x, int y, RECT r) {
-    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+// Input handler for custom CPU core clocks
+void HandleSetCoreClockInput(int core, int mhz) {
+    if (SmuSetAllCoreFrequency(mhz)) {
+        MessageBoxW(g_hOverlay, L"All-core frequency set successfully!", L"ZenStates", MB_OK);
+    } else {
+        MessageBoxW(g_hOverlay, L"Failed to set frequency. Run as Administrator.", L"ZenStates", MB_OK);
+    }
 }
 
-// Helper: Calculate Slider % from Mouse X
-void UpdateFanFromMouse(int x) {
-    RECT r = g_RectFanControl;
-    float width = (float)(r.right - r.left);
-    if (width <= 0) return;
-
-    // Relative X
-    float relX = (float)(x - r.left);
-
-    // Percent 0.0 to 1.0
-    float pct = relX / width;
-
-    // Clamp
-    if (pct < 0.1f) pct = 0.1f; // Min 10%
-    if (pct > 1.0f) pct = 1.0f; // Max 100%
-
-    // Set global target (system.cpp picks this up)
-    int newSpeed = (int)(pct * 100.0f);
-    SetFanSpeed(newSpeed);
+bool IsPointInRect(int x, int y, RECT r) {
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -331,14 +347,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0); return 0;
         }
 
-        // --- FAN SLIDER CLICK ---
-        if (InitFanControl() && IsPointInRect(x, y, g_RectFanControl)) {
-            g_DraggingFan = true;
-            SetCapture(hwnd); // Capture mouse so we can drag outside the rect
-            UpdateFanFromMouse(x);
-            return 0;
-        }
-
         if (IsPointInRect(x, y, g_RectMultiCore)) { StartBenchmark(true); return 0; }
         if (IsPointInRect(x, y, g_RectSingleCore)) { StartBenchmark(false); return 0; }
         if (IsPointInRect(x, y, g_RectGpuTest)) { StartGpuBenchmark(); return 0; }
@@ -347,19 +355,62 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (IsPointInRect(x, y, g_RectRamBurn)) { g_RamStress = !g_RamStress; if (g_RamStress) StartRamStress(); return 0; }
         if (IsPointInRect(x, y, g_RectGpuBurn)) { g_GpuStress = !g_GpuStress; if (g_GpuStress) StartGpuStress(); return 0; }
 
+        // All-core frequency input box
+        if (IsPointInRect(x, y, g_RectCoreClkInput)) {
+            g_EditingCoreClk = true;
+            g_CoreClkInput = L"";
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
+            return 0;
+        }
+
         SendMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0); return 0;
     }
-    case WM_MOUSEMOVE: {
-        if (g_DraggingFan) {
-            int x = GET_X_LPARAM(lParam);
-            UpdateFanFromMouse(x);
+    case WM_KEYDOWN: {
+        if (g_EditingCoreClk) {
+            if (wParam == VK_RETURN) {
+                if (!g_CoreClkInput.empty()) {
+                    int mhz = _wtoi(g_CoreClkInput.c_str());
+                    if (mhz >= 550 && mhz <= 7000 && mhz % 25 == 0) {
+                        int freqCopy = mhz;
+                        std::thread([freqCopy]() { SmuSetAllCoreFrequency(freqCopy); }).detach();
+                        g_CoreClkInput = L"";
+                        g_EditingCoreClk = false;
+                    } else {
+                        g_CoreClkInput = L"INVALID";
+                    }
+                }
+                return 0;
+            }
+            if (wParam == VK_ESCAPE) {
+                g_EditingCoreClk = false;
+                g_CoreClkInput = L"";
+                return 0;
+            }
+        } else {
+            // Core selection (0-7)
+            int coreCount = (int)g_CoreLoad.size();
+            if (coreCount > 8) coreCount = 8;
+            if (wParam >= '0' && wParam <= '7') {
+                int coreIdx = wParam - '0';
+                if (coreIdx < coreCount) {
+                    g_SelectedCore = coreIdx;
+                    return 0;
+                }
+            }
         }
         return 0;
     }
-    case WM_LBUTTONUP: {
-        if (g_DraggingFan) {
-            g_DraggingFan = false;
-            ReleaseCapture();
+    case WM_CHAR: {
+        if (g_EditingCoreClk) {
+            if (isdigit((char)wParam)) {
+                if (g_CoreClkInput.length() < 5) {
+                    g_CoreClkInput += (wchar_t)wParam;
+                }
+            } else if (wParam == VK_BACK && !g_CoreClkInput.empty()) {
+                g_CoreClkInput.pop_back();
+            }
+            return 0;
         }
         return 0;
     }
@@ -378,9 +429,11 @@ int main() {
 
     std::thread(MonitorCpu).detach();
     std::thread(MonitorSystem).detach();
+    std::thread([]() { while (g_AppRunning) { UpdateCpuAndRamInfo(); std::this_thread::sleep_for(std::chrono::milliseconds(2000)); } }).detach();
     std::thread([]() { GetDetailedRamInfo(); }).detach();
     std::thread(CheckStorage).detach();
     std::thread([]() { while (g_AppRunning) { MonitorGpu(); UpdateNvidiaStats(); std::this_thread::sleep_for(std::chrono::milliseconds(1000)); } }).detach();
+    std::thread([]() { InitSmuBridge(); }).detach();
 
     Gdiplus::GdiplusStartupInput gsi; ULONG_PTR tok; Gdiplus::GdiplusStartup(&tok, &gsi, NULL);
     int w = UI_WIDTH_NORMAL; int h = 850; int x = GetSystemMetrics(SM_CXSCREEN) - w - g_Cfg.xOffset;

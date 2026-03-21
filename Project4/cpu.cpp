@@ -1,11 +1,17 @@
 #include "shared.hpp"
 #include <pdh.h>
 #include <pdhmsg.h>
-#include <immintrin.h> 
+#include <immintrin.h>
+#include <intrin.h>
 #include <fstream>
 #include <filesystem>
 #include <comdef.h>
 #include <Wbemidl.h>
+#include <windows.h>
+#include <string>
+#include <vector>
+#include <atomic>
+#include <mutex>
 
 namespace fs = std::filesystem;
 
@@ -14,6 +20,11 @@ int g_CpuUsage = 0;
 std::vector<int> g_CoreLoad;
 int g_CpuTemp = 0;
 std::wstring g_CpuName = L"CPU";
+int g_CpuClock = 0;
+int g_CpuTdp = 0;
+std::wstring g_RamTimings = L"";
+int g_SelectedCoreIndex = 0;
+int g_TargetCoreClock = 0;
 
 std::atomic<int> g_BenchScore = 0;
 std::atomic<bool> g_BenchRunning = false;
@@ -202,4 +213,202 @@ void MonitorCpu() {
         }
         Sleep(500);
     }
+}
+
+// --- CPU INFO (WMI/PDH) ---
+void UpdateCpuInfo() {
+    IWbemLocator* pLoc = nullptr;
+    IWbemServices* pSvc = nullptr;
+    HRESULT hr = CoInitializeEx(0, COINIT_MULTITHREADED);
+
+    if (SUCCEEDED(hr)) {
+        hr = CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&pLoc);
+        if (SUCCEEDED(hr)) {
+            hr = pLoc->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), NULL, NULL, 0, NULL, 0, 0, &pSvc);
+            if (SUCCEEDED(hr)) {
+                // Get CPU Info: Name, Clock Speed, Cores
+                IEnumWbemClassObject* pEnum = nullptr;
+                hr = pSvc->ExecQuery(bstr_t("WQL"), bstr_t(L"SELECT Name, MaxClockSpeed, NumberOfCores, NumberOfLogicalProcessors FROM Win32_Processor"), WBEM_FLAG_FORWARD_ONLY, NULL, &pEnum);
+                if (SUCCEEDED(hr) && pEnum) {
+                    IWbemClassObject* pObj = nullptr; ULONG uRet = 0;
+                    if (pEnum->Next(WBEM_INFINITE, 1, &pObj, &uRet) == S_OK && uRet) {
+                        VARIANT vName, vClock, vCores, vThreads;
+                        pObj->Get(L"Name", 0, &vName, 0, 0);
+                        pObj->Get(L"MaxClockSpeed", 0, &vClock, 0, 0);
+                        pObj->Get(L"NumberOfCores", 0, &vCores, 0, 0);
+                        pObj->Get(L"NumberOfLogicalProcessors", 0, &vThreads, 0, 0);
+
+                        if (vName.vt == VT_BSTR) g_CpuName = vName.bstrVal;
+                        if (vClock.vt == VT_I4) g_CpuClock = vClock.intVal;
+
+                        VariantClear(&vName); VariantClear(&vClock); VariantClear(&vCores); VariantClear(&vThreads);
+                        pObj->Release();
+                    }
+                    pEnum->Release();
+                }
+
+                // Get CPU Temp via WMI (may not be available on all systems)
+                pEnum = nullptr;
+                hr = pSvc->ExecQuery(bstr_t("WQL"), bstr_t(L"SELECT CurrentTemperature FROM Win32_PerfFormattedData_Counters_ThermalZoneInformation"), WBEM_FLAG_FORWARD_ONLY, NULL, &pEnum);
+                if (SUCCEEDED(hr) && pEnum) {
+                    IWbemClassObject* pObj = nullptr; ULONG uRet = 0;
+                    if (pEnum->Next(WBEM_INFINITE, 1, &pObj, &uRet) == S_OK && uRet) {
+                        VARIANT vTemp;
+                        pObj->Get(L"CurrentTemperature", 0, &vTemp, 0, 0);
+                        if (vTemp.vt == VT_I4) g_CpuTemp = (vTemp.intVal - 2732) / 10;
+                        VariantClear(&vTemp);
+                        pObj->Release();
+                    }
+                    pEnum->Release();
+                }
+            }
+            pSvc->Release();
+        }
+        pLoc->Release();
+        CoUninitialize();
+    }
+}
+
+// --- RAM TIMINGS (ZenStates.dll) ---
+typedef const char* (__stdcall* ZENSTATES_GETRAMTIMINGS)();
+void UpdateRamTimings() {
+    HMODULE hZen = LoadLibraryW(L"ZenStates.dll");
+    if (hZen) {
+        ZENSTATES_GETRAMTIMINGS getTimings = (ZENSTATES_GETRAMTIMINGS)GetProcAddress(hZen, "GetRamTimings");
+        if (getTimings) {
+            const char* timings = getTimings();
+            if (timings) {
+                int len = MultiByteToWideChar(CP_UTF8, 0, timings, -1, NULL, 0);
+                if (len > 0) {
+                    wchar_t* wstr = new wchar_t[len];
+                    MultiByteToWideChar(CP_UTF8, 0, timings, -1, wstr, len);
+                    g_RamTimings = wstr;
+                    delete[] wstr;
+                }
+            }
+        }
+        FreeLibrary(hZen);
+    } else {
+        g_RamTimings = L"N/A";
+    }
+}
+
+// --- CORE CLOCK (ZenStates-core.dll wrapper) ---
+
+// Wrapper functions for ZenStates-core.dll
+namespace ZenStatesInterop {
+    static HMODULE g_hZenStates = NULL;
+
+    bool LoadZenStatesDll() {
+        if (g_hZenStates != NULL)
+            return true;
+
+        const wchar_t* searchPaths[] = {
+            L"ZenStates-core.dll",
+            L".\\ZenStates-core.dll",
+            L"..\\ZenStates-core.dll",
+        };
+
+        for (const wchar_t* path : searchPaths) {
+            g_hZenStates = LoadLibraryW(path);
+            if (g_hZenStates != NULL)
+                return true;
+        }
+        return false;
+    }
+}
+
+bool SetCoreClockNative(int core, int mhz) {
+    if (!ZenStatesInterop::LoadZenStatesDll()) {
+        OutputDebugStringW(L"✗ Failed to load ZenStates-core.dll");
+        return false;
+    }
+
+    // Try multiple calling conventions and function names
+    typedef int(__stdcall* SETCORECLOCK_STDCALL)(int, int);
+    typedef int(__cdecl* SETCORECLOCK_CDECL)(int, int);
+
+    SETCORECLOCK_STDCALL setClockFunc_stdcall = NULL;
+    SETCORECLOCK_CDECL setClockFunc_cdecl = NULL;
+
+    const char* functionNames[] = {
+        "SetCoreClock",
+        "SetP0Clock",
+        "ApplyCoreClock",
+    };
+
+    // List what functions we find
+    OutputDebugStringW(L"\n✓ DLL loaded, searching for SetCoreClock function...");
+
+    for (const char* funcName : functionNames) {
+        void* func = GetProcAddress(ZenStatesInterop::g_hZenStates, funcName);
+        if (func) {
+            wchar_t msg[256];
+            swprintf_s(msg, L"✓ Found function: %S", funcName);
+            OutputDebugStringW(msg);
+
+            // Try __stdcall first
+            setClockFunc_stdcall = (SETCORECLOCK_STDCALL)func;
+            try {
+                int result = setClockFunc_stdcall(core, mhz);
+                wchar_t msg2[256];
+                swprintf_s(msg2, L"✓ SetCoreClock returned: %d", result);
+                OutputDebugStringW(msg2);
+                return (result == 0);
+            }
+            catch (...) {
+                OutputDebugStringW(L"✗ Exception with __stdcall, trying __cdecl...");
+            }
+
+            // Try __cdecl
+            setClockFunc_cdecl = (SETCORECLOCK_CDECL)func;
+            try {
+                int result = setClockFunc_cdecl(core, mhz);
+                wchar_t msg2[256];
+                swprintf_s(msg2, L"✓ SetCoreClock (cdecl) returned: %d", result);
+                OutputDebugStringW(msg2);
+                return (result == 0);
+            }
+            catch (...) {
+                OutputDebugStringW(L"✗ Exception with __cdecl");
+            }
+        } else {
+            wchar_t msg[256];
+            swprintf_s(msg, L"✗ Function not found: %S", funcName);
+            OutputDebugStringW(msg);
+        }
+    }
+
+    OutputDebugStringW(L"✗ No valid function found");
+    return false;
+}
+
+// Set CPU core clock using ZenStates-Core.dll
+bool SetCpuCoreClock(int core, int mhz) {
+    if (core < 0 || core > 15) {
+        MessageBoxW(NULL, L"Invalid core index (0-15)", L"Error", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    if (mhz < 400 || mhz > 5000) {
+        MessageBoxW(NULL, L"Clock speed must be 400-5000 MHz", L"Error", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    bool result = SetCoreClockNative(core, mhz);
+
+    if (result) {
+        wchar_t msg[256];
+        swprintf_s(msg, L"Core %d set to %d MHz", core, mhz);
+        MessageBoxW(NULL, msg, L"Success", MB_OK | MB_ICONINFORMATION);
+    } else {
+        MessageBoxW(NULL, L"Failed to set core clock. Make sure ZenStates-core.dll is available.", L"Error", MB_OK | MB_ICONERROR);
+    }
+
+    return result;
+}
+
+// Call these periodically to update CPU and RAM info
+void UpdateCpuAndRamInfo() {
+    UpdateCpuInfo();
+    UpdateRamTimings();
 }

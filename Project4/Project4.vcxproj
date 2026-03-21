@@ -24,6 +24,8 @@
     <ProjectGuid>{b921b62f-8eeb-49f4-a031-3e035bc2ed41}</ProjectGuid>
     <RootNamespace>Project4</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <TargetFrameworkVersion>
+    </TargetFrameworkVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
@@ -82,6 +84,7 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
+    <PostBuildEvent><Command>copy /Y "$(ProjectDir)embed\SMUDebugTool.exe" "$(OutDir)SMUDebugTool.exe"&#xA;copy /Y "$(ProjectDir)embed\ZenStates-Core.dll" "$(OutDir)ZenStates-Core.dll"&#xA;copy /Y "$(ProjectDir)embed\inpoutx64.dll" "$(OutDir)inpoutx64.dll"</Command></PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
@@ -97,6 +100,7 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
+    <PostBuildEvent><Command>copy /Y "$(ProjectDir)embed\SMUDebugTool.exe" "$(OutDir)SMUDebugTool.exe"&#xA;copy /Y "$(ProjectDir)embed\ZenStates-Core.dll" "$(OutDir)ZenStates-Core.dll"&#xA;copy /Y "$(ProjectDir)embed\inpoutx64.dll" "$(OutDir)inpoutx64.dll"</Command></PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -110,6 +114,7 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
+    <PostBuildEvent><Command>copy /Y "$(ProjectDir)embed\SMUDebugTool.exe" "$(OutDir)SMUDebugTool.exe"&#xA;copy /Y "$(ProjectDir)embed\ZenStates-Core.dll" "$(OutDir)ZenStates-Core.dll"&#xA;copy /Y "$(ProjectDir)embed\inpoutx64.dll" "$(OutDir)inpoutx64.dll"</Command></PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -129,8 +134,8 @@
       <EntryPointSymbol>
       </EntryPointSymbol>
       <AdditionalLibraryDirectories>C:\Users\User\Desktop\nvapi-main\amd64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>nvapi64.lib;%(AdditionalDependencies)</AdditionalDependencies>
-    </Link>
+      <AdditionalDependencies>nvapi64.lib;%(AdditionalDependencies)</AdditionalDependencies><UACExecutionLevel>RequireAdministrator</UACExecutionLevel></Link>
+    <PostBuildEvent><Command>copy /Y "$(ProjectDir)embed\SMUDebugTool.exe" "$(OutDir)SMUDebugTool.exe"&#xA;copy /Y "$(ProjectDir)embed\ZenStates-Core.dll" "$(OutDir)ZenStates-Core.dll"&#xA;copy /Y "$(ProjectDir)embed\inpoutx64.dll" "$(OutDir)inpoutx64.dll"</Command></PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="cpu.cpp" />
@@ -138,14 +143,24 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Nvidia.cpp" />
     <ClCompile Include="ram.cpp" />
+    <ClCompile Include="SmuBridge.cpp" />
     <ClCompile Include="storage.cpp" />
     <ClCompile Include="system.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ChipDefs.hpp" />
+    <ClInclude Include="resource.h" />
     <ClInclude Include="Shared.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="SmuTool.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Manifest Include="app.manifest" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>
+
+

@@ -1,7 +1,23 @@
 #include "shared.hpp"
+#include <windows.h>
 #include <gl/GL.h>
 #include <chrono>
 #include <dxgi.h>
+#include <mutex>
+#ifdef _NVAPI_H_
+#include "nvapi.h"
+#pragma comment(lib, "nvapi.lib")
+#define HAVE_NVAPI 1
+#else
+#define HAVE_NVAPI 0
+#endif
+#ifdef _ADLX_H_
+#include "ADLX.h"
+#pragma comment(lib, "adlx.lib")
+#define HAVE_ADLX 1
+#else
+#define HAVE_ADLX 0
+#endif
 
 #pragma comment(lib, "opengl32.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -14,7 +30,7 @@ std::atomic<bool> g_GpuBenchRunning = false;
 unsigned long long g_GpuVramUsed = 0;
 unsigned long long g_GpuVramTotal = 0;
 
-// GPU Stats (NVAPI)
+// GPU Stats (NVAPI/ADLX)
 int g_GpuTemp = 0;
 int g_GpuTempAvg = 0;
 int g_GpuTempMin = 999;
@@ -41,54 +57,59 @@ std::wstring g_GpuDriverVersion = L"Unknown";
 std::string g_GpuPciDeviceId = "N/A";
 int g_GpuPcieLanes = 0;
 
-void InitGpuInfo() {
-    std::string command = "nvidia-smi --query-gpu=name --format=csv,noheader -i 0";
-    std::string output;
-    
-    HANDLE hPipeRead, hPipeWrite;
-    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
-    
-    if (CreatePipe(&hPipeRead, &hPipeWrite, &sa, 0)) {
-        STARTUPINFOA si = { 0 };
-        si.cb = sizeof(STARTUPINFOA);
-        si.hStdOutput = hPipeWrite;
-        si.hStdError = hPipeWrite;
-        si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
+std::mutex g_GpuMutex;
 
-        PROCESS_INFORMATION pi = { 0 };
-        
-        if (CreateProcessA(NULL, (LPSTR)command.c_str(), NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-            CloseHandle(hPipeWrite);
-            
-            char buffer[256] = { 0 };
-            DWORD bytesRead = 0;
-            if (ReadFile(hPipeRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL)) {
-                std::string gpuName(buffer);
-                // Remove trailing whitespace/newlines
-                gpuName.erase(gpuName.find_last_not_of(" \n\r\t") + 1);
-                
-                if (!gpuName.empty()) {
-                    std::lock_guard<std::mutex> l(g_StatsMutex);
-                    int len = MultiByteToWideChar(CP_UTF8, 0, gpuName.c_str(), -1, NULL, 0);
-                    if (len > 0) {
-                        wchar_t* wstr = new wchar_t[len];
-                        MultiByteToWideChar(CP_UTF8, 0, gpuName.c_str(), -1, wstr, len);
-                        g_GpuName = wstr;
-                        delete[] wstr;
-                    }
-                }
+void InitGpuInfo() {
+    std::lock_guard<std::mutex> lock(g_GpuMutex);
+#if HAVE_NVAPI
+    if (NvAPI_Initialize() == NVAPI_OK) {
+        NvPhysicalGpuHandle handles[NVAPI_MAX_PHYSICAL_GPUS] = { 0 };
+        NvU32 count = 0;
+        if (NvAPI_EnumPhysicalGPUs(handles, &count) == NVAPI_OK && count > 0) {
+            NvPhysicalGpuHandle gpu = handles[0];
+            NvAPI_ShortString name = { 0 };
+            if (NvAPI_GPU_GetFullName(gpu, name) == NVAPI_OK) {
+                g_GpuName = std::wstring(name, name + strlen(name));
             }
-            
-            CloseHandle(hPipeRead);
-            WaitForSingleObject(pi.hProcess, INFINITE);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-        } else {
-            CloseHandle(hPipeRead);
-            CloseHandle(hPipeWrite);
+            NV_DISPLAY_DRIVER_MEMORY_INFO memInfo = { 0 };
+            memInfo.version = NV_DISPLAY_DRIVER_MEMORY_INFO_VER;
+            if (NvAPI_GPU_GetMemoryInfo(gpu, &memInfo) == NVAPI_OK) {
+                g_GpuVramTotal = memInfo.dedicatedVideoMemory;
+                g_GpuVramUsed = memInfo.dedicatedVideoMemory - memInfo.availableDedicatedVideoMemory;
+            }
+            // Optionally: get PCIe, mem type, etc.
+            return;
         }
     }
+#endif
+#if HAVE_ADLX
+    // ADLX AMD GPU detection (pseudo-code, requires ADLX SDK)
+    adlx::IADLXSystem* pSystem = nullptr;
+    if (ADLXHelper_Initialize(&pSystem) == ADLX_OK && pSystem) {
+        adlx::IADLXGPUList* pGpuList = nullptr;
+        if (pSystem->GetGPUs(&pGpuList) == ADLX_OK && pGpuList) {
+            adlx::IADLXGPU* pGpu = nullptr;
+            if (pGpuList->At(0, &pGpu) == ADLX_OK && pGpu) {
+                adlx::IADLXGPUName* pName = nullptr;
+                if (pGpu->Name(&pName) == ADLX_OK && pName) {
+                    const wchar_t* wname = nullptr;
+                    pName->GetName(&wname);
+                    if (wname) g_GpuName = wname;
+                    pName->Release();
+                }
+                adlx::IADLXGPUMemory* pMem = nullptr;
+                if (pGpu->Memory(&pMem) == ADLX_OK && pMem) {
+                    g_GpuVramTotal = pMem->TotalMemory();
+                    g_GpuVramUsed = pMem->UsedMemory();
+                    pMem->Release();
+                }
+                pGpu->Release();
+            }
+            pGpuList->Release();
+        }
+        pSystem->Release();
+    }
+#endif
 }
 
 void UpdateGpuVram() {
@@ -159,3 +180,198 @@ void StartGpuStress() {
     g_GpuStress = true;
     std::thread(GpuStressWorker).detach();
 }
+
+void UpdateGpuStats() {
+    std::lock_guard<std::mutex> lock(g_GpuMutex);
+    std::string gpuNameStr;
+    bool nvapiSuccess = false;
+#if HAVE_NVAPI
+    if (NvAPI_Initialize() == NVAPI_OK) {
+        NvPhysicalGpuHandle handles[NVAPI_MAX_PHYSICAL_GPUS] = { 0 };
+        NvU32 count = 0;
+        if (NvAPI_EnumPhysicalGPUs(handles, &count) == NVAPI_OK && count > 0) {
+            NvPhysicalGpuHandle gpu = handles[0];
+            NvAPI_ShortString name = { 0 };
+            if (NvAPI_GPU_GetFullName(gpu, name) == NVAPI_OK) {
+                gpuNameStr = name;
+                g_GpuName = std::wstring(name, name + strlen(name));
+            }
+            NV_DISPLAY_DRIVER_MEMORY_INFO memInfo = { 0 };
+            memInfo.version = NV_DISPLAY_DRIVER_MEMORY_INFO_VER;
+            if (NvAPI_GPU_GetMemoryInfo(gpu, &memInfo) == NVAPI_OK) {
+                g_GpuVramTotal = memInfo.dedicatedVideoMemory;
+                g_GpuVramUsed = memInfo.dedicatedVideoMemory - memInfo.availableDedicatedVideoMemory;
+            }
+            NV_GPU_THERMAL_SETTINGS thermalInfo = { 0 };
+            thermalInfo.version = NV_GPU_THERMAL_SETTINGS_VER;
+            if (NvAPI_GPU_GetThermalSettings(gpu, NVAPI_THERMAL_TARGET_ALL, &thermalInfo) == NVAPI_OK) {
+                int temp = (int)thermalInfo.sensor[0].currentTemp;
+                g_GpuTemp = temp;
+                if (temp > g_GpuTempMax) g_GpuTempMax = temp;
+                if (temp < g_GpuTempMin) g_GpuTempMin = temp;
+                g_GpuTempAvg = (g_GpuTempAvg + temp) / 2;
+            }
+            NV_GPU_CLOCK_FREQUENCIES clockInfo = { 0 };
+            clockInfo.version = NV_GPU_CLOCK_FREQUENCIES_VER;
+            if (NvAPI_GPU_GetAllClockFrequencies(gpu, &clockInfo) == NVAPI_OK) {
+                if (clockInfo.domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].bIsPresent) {
+                    int coreClock = clockInfo.domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].frequency / 1000;
+                    g_GpuCoreClock = coreClock;
+                    if (coreClock > g_GpuCoreClockMax) g_GpuCoreClockMax = coreClock;
+                    if (coreClock < g_GpuCoreClockMin) g_GpuCoreClockMin = coreClock;
+                }
+                if (clockInfo.domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].bIsPresent) {
+                    int memClock = clockInfo.domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].frequency / 1000;
+                    g_GpuMemClock = memClock;
+                    if (memClock > g_GpuMemClockMax) g_GpuMemClockMax = memClock;
+                    if (memClock < g_GpuMemClockMin) g_GpuMemClockMin = memClock;
+                }
+            }
+            NV_GPU_DYNAMIC_PSTATES_INFO_EX pstateInfo = { 0 };
+            pstateInfo.version = NV_GPU_DYNAMIC_PSTATES_INFO_EX_VER;
+            if (NvAPI_GPU_GetDynamicPstatesInfoEx(gpu, &pstateInfo) == NVAPI_OK) {
+                g_GpuUtilization = pstateInfo.utilization[NVAPI_GPU_UTILIZATION_DOMAIN_GPU].percentage;
+                g_GpuMemUtilization = pstateInfo.utilization[NVAPI_GPU_UTILIZATION_DOMAIN_FB].percentage;
+            }
+            NvU32 power = 0;
+            if (NvAPI_GPU_GetPowerUsage(gpu, &power) == NVAPI_OK) {
+                g_GpuPowerDraw = power / 1000.0;
+            }
+            NvU32 powerLimit = 0;
+            if (NvAPI_GPU_GetPowerManagementLimit(gpu, &powerLimit) == NVAPI_OK) {
+                g_GpuPowerLimit = powerLimit / 1000.0;
+            }
+            NvU32 fanSpeedRPM = 0;
+            if (NvAPI_GPU_GetTachReading(gpu, &fanSpeedRPM) == NVAPI_OK) {
+                g_GpuFanRPM = fanSpeedRPM;
+            }
+            nvapiSuccess = true;
+        }
+    }
+#endif
+    // Fallback: Use nvidia-smi if NVAPI unavailable or failed
+    if (!nvapiSuccess) {
+        std::string cmd_str = "nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,utilization.memory,power.draw,power.limit,fan.speed,clocks.current.graphics,clocks.current.memory,memory.used,memory.total --format=csv,noheader,nounits -i 0";
+        
+        // CreateProcessA needs a modifiable string
+        char cmdLine[512];
+        strcpy_s(cmdLine, sizeof(cmdLine), cmd_str.c_str());
+
+        HANDLE hPipeRead, hPipeWrite;
+        SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+
+        if (CreatePipe(&hPipeRead, &hPipeWrite, &sa, 0)) {
+            STARTUPINFOA si = { 0 };
+            si.cb = sizeof(STARTUPINFOA);
+            si.hStdOutput = hPipeWrite;
+            si.hStdError = hPipeWrite;
+            si.dwFlags = STARTF_USESTDHANDLES;
+
+            PROCESS_INFORMATION pi = { 0 };
+
+            if (CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+                CloseHandle(hPipeWrite);
+                
+                // Wait for process to complete BEFORE reading pipe
+                WaitForSingleObject(pi.hProcess, INFINITE);
+
+                char buffer[512] = { 0 };
+                DWORD bytesRead = 0;
+                if (ReadFile(hPipeRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+                    buffer[bytesRead] = '\0';
+                    std::stringstream ss(buffer);
+                    std::string item;
+                    if (std::getline(ss, item, ',')) {
+                        // Remove leading/trailing whitespace and stray chars
+                        item.erase(0, item.find_first_not_of(" \t\r\n"));
+                        item.erase(item.find_last_not_of(" \t\r\n") + 1);
+                        gpuNameStr = item;
+                        g_GpuName = std::wstring(item.begin(), item.end());
+                    }
+                    if (std::getline(ss, item, ',')) g_GpuTemp = std::stoi(item);
+                    if (std::getline(ss, item, ',')) g_GpuUtilization = std::stoi(item);
+                    if (std::getline(ss, item, ',')) g_GpuMemUtilization = std::stoi(item);
+                    if (std::getline(ss, item, ',')) g_GpuPowerDraw = std::stod(item);
+                    if (std::getline(ss, item, ',')) g_GpuPowerLimit = std::stod(item);
+                    if (std::getline(ss, item, ',')) g_GpuFanRPM = (std::stoi(item) * 3000) / 100;
+                    if (std::getline(ss, item, ',')) g_GpuCoreClock = std::stoi(item);
+                    if (std::getline(ss, item, ',')) g_GpuMemClock = std::stoi(item);
+                    if (std::getline(ss, item, ',')) g_GpuVramUsed = std::stoull(item) * 1024 * 1024;
+                    if (std::getline(ss, item, ',')) g_GpuVramTotal = std::stoull(item) * 1024 * 1024;
+                }
+
+                CloseHandle(hPipeRead);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            } else {
+                std::cout << "[nvidia-smi] Failed to run nvidia-smi" << std::endl;
+            }
+        }
+    }
+    // AMD GPU (ADLX)
+#if HAVE_ADLX
+    if (gpuNameStr.find("AMD") == 0 || gpuNameStr.find("Radeon") == 0) {
+        adlx::IADLXSystem* pSystem = nullptr;
+        if (ADLXHelper_Initialize(&pSystem) == ADLX_OK && pSystem) {
+            adlx::IADLXGPUList* pGpuList = nullptr;
+            if (pSystem->GetGPUs(&pGpuList) == ADLX_OK && pGpuList) {
+                adlx::IADLXGPU* pGpu = nullptr;
+                if (pGpuList->At(0, &pGpu) == ADLX_OK && pGpu) {
+                    adlx::IADLXGPUName* pName = nullptr;
+                    if (pGpu->Name(&pName) == ADLX_OK && pName) {
+                        const wchar_t* wname = nullptr;
+                        pName->GetName(&wname);
+                        if (wname) g_GpuName = wname;
+                        pName->Release();
+                    }
+                    adlx::IADLXGPUMemory* pMem = nullptr;
+                    if (pGpu->Memory(&pMem) == ADLX_OK && pMem) {
+                        g_GpuVramTotal = pMem->TotalMemory();
+                        g_GpuVramUsed = pMem->UsedMemory();
+                        pMem->Release();
+                    }
+                    adlx::IADLXGPUThermal* pThermal = nullptr;
+                    if (pGpu->Thermal(&pThermal) == ADLX_OK && pThermal) {
+                        g_GpuTemp = pThermal->Temperature();
+                        if (g_GpuTemp > g_GpuTempMax) g_GpuTempMax = g_GpuTemp;
+                        if (g_GpuTemp < g_GpuTempMin) g_GpuTempMin = g_GpuTemp;
+                        g_GpuTempAvg = (g_GpuTempAvg + g_GpuTemp) / 2;
+                        pThermal->Release();
+                    }
+                    adlx::IADLXGPUClocks* pClocks = nullptr;
+                    if (pGpu->Clocks(&pClocks) == ADLX_OK && pClocks) {
+                        g_GpuCoreClock = pClocks->CoreClock();
+                        g_GpuMemClock = pClocks->MemoryClock();
+                        pClocks->Release();
+                    }
+                    adlx::IADLXGPUUtilization* pUtil = nullptr;
+                    if (pGpu->Utilization(&pUtil) == ADLX_OK && pUtil) {
+                        g_GpuUtilization = pUtil->GPUUtilization();
+                        g_GpuMemUtilization = pUtil->MemoryUtilization();
+                        pUtil->Release();
+                    }
+                    adlx::IADLXGPUPower* pPower = nullptr;
+                    if (pGpu->Power(&pPower) == ADLX_OK && pPower) {
+                        g_GpuPowerDraw = pPower->PowerDraw();
+                        g_GpuPowerLimit = pPower->PowerLimit();
+                        pPower->Release();
+                    }
+                    adlx::IADLXGPUFan* pFan = nullptr;
+                    if (pGpu->Fan(&pFan) == ADLX_OK && pFan) {
+                        g_GpuFanRPM = pFan->FanSpeedRPM();
+                        pFan->Release();
+                    }
+                    pGpu->Release();
+                }
+                pGpuList->Release();
+            }
+            pSystem->Release();
+        }
+    }
+#endif
+}
+
+// Provide compatibility wrappers for legacy Nvidia functions
+void InitNvidiaGpu() { InitGpuInfo(); }
+void MonitorGpu() { UpdateGpuStats(); }
+void UpdateNvidiaStats() { UpdateGpuStats(); }
